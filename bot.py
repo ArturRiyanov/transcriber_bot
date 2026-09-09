@@ -40,7 +40,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📡 Запускаю браузер...")
         p = await async_playwright().start()
         
-        # Запускаем браузер — звук пойдёт в системный sink (мы сделали virtual_sink дефолтным)
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -73,7 +72,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Запуск ffmpeg – записываем с монитора virtual_sink
         await update.message.reply_text("🎙️ Запускаю ffmpeg...")
         ffmpeg_cmd = (
             f"ffmpeg -f pulse -i virtual_sink.monitor "
@@ -96,6 +94,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     error_log = f.read()[:500]
             await update.message.reply_text(f"⚠️ ffmpeg не создал файл. Ошибка: {error_log if error_log else 'неизвестна'}")
 
+        # Сохраняем сессию
         active_sessions[chat_id] = {
             'playwright': p,
             'browser': browser,
@@ -106,6 +105,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'update': update,
             'cmd': ffmpeg_cmd
         }
+        await update.message.reply_text(f"🔍 Сессия сохранена для chat_id={chat_id}")  # отладка
 
         screenshot = await page.screenshot()
         await update.message.reply_photo(
@@ -128,10 +128,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 async def stop_session(chat_id, update=None, notify=True):
+    # Проверяем наличие сессии
     if chat_id not in active_sessions:
         if update and notify:
             await update.message.reply_text("❌ Нет активной сессии для остановки.")
-        return False
+        return False, None, ["Сессия не найдена"]
 
     session = active_sessions[chat_id]
     if update is None:
@@ -186,6 +187,7 @@ async def stop_session(chat_id, update=None, notify=True):
         duration = datetime.now() - session['start_time']
         log_msgs.append(f"⏱️ Длительность: {duration.seconds//60} мин {duration.seconds%60} сек")
 
+    # Удаляем сессию
     del active_sessions[chat_id]
 
     # Проверка файла
@@ -262,6 +264,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text("⏳ Останавливаю сессию...")
     try:
+        # stop_session всегда возвращает кортеж из 3 элементов
         success, transcription, errors = await stop_session(chat_id, update=update, notify=True)
         if not success:
             await update.message.reply_text("❌ Не удалось остановить сессию.")
