@@ -5,26 +5,28 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 from faster_whisper import WhisperModel
 
 # ---------- Конфигурация ----------
-TELEGRAM_TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 if not DEEPSEEK_API_KEY:
     raise ValueError("DEEPSEEK_API_KEY environment variable not set")
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# Модель Whisper (tiny – быстрая)
-model = WhisperModel("tiny", device="cpu", compute_type="int8")
+# Модель Whisper: base (компромисс скорость/качество)
+model = WhisperModel("base", device="cpu", compute_type="int8")
 
-# ---------- Функция улучшения текста через DeepSeek ----------
+# ---------- Улучшенная функция обработки через DeepSeek ----------
 def improve_text(text: str) -> str:
     if not text or len(text.strip()) < 5:
         return text
 
     prompt = (
-        "Ты — профессиональный корректор. Исправь ошибки в расшифровке речи, "
-        "расставь знаки препинания, заглавные буквы, сделай текст грамотным и читаемым. "
-        "Сохрани смысл дословно, не добавляй и не убирай информацию.\n\n"
-        f"Текст для исправления:\n{text}"
+        "Ты — эксперт по исправлению транскрипций. Ниже дан текст, полученный автоматическим распознаванием речи. "
+        "В нём много ошибок, пропусков, искажённых слов. Твоя задача — восстановить смысл, исправив все ошибки, "
+        "расставить знаки препинания, заглавные буквы, сделать текст грамотным и понятным. "
+        "Если какое-то слово неразборчиво — попробуй догадаться по контексту. Не добавляй информацию, которой нет, "
+        "но исправляй явные ошибки.\n\n"
+        f"Транскрипция:\n{text}"
     )
 
     headers = {
@@ -32,12 +34,12 @@ def improve_text(text: str) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "deepseek-chat",
+        "model": "deepseek-reasoner",
         "messages": [
-            {"role": "system", "content": "Ты — помощник, исправляющий расшифровки речи."},
+            {"role": "system", "content": "Ты — корректор транскрипций речи."},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.3,
+        "temperature": 0.1,
         "max_tokens": 2000
     }
 
@@ -74,10 +76,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         segments, info = model.transcribe(
             path,
-            beam_size=3,
+            beam_size=5,
             language='ru',
             temperature=0.0,
-            vad_filter=True
+            vad_filter=True,
+            condition_on_previous_text=False
         )
         raw_text = " ".join(seg.text for seg in segments)
 
@@ -97,7 +100,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(path)
 
 if __name__ == "__main__":
-    print("[LOG] Запуск бота с улучшением через DeepSeek...")
+    print("[LOG] Запуск бота с улучшением через DeepSeek (модель base)...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO, handle_audio))
