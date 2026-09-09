@@ -3,6 +3,7 @@ import asyncio
 import base64
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -16,6 +17,25 @@ TXT_FILE = "transcript.txt"
 
 model = WhisperModel("base", device="cpu", compute_type="int8")
 active_sessions = {}
+
+XVFB_PROCESS = None
+
+def ensure_xvfb(display=":99", screen="1280x720x24"):
+    global XVFB_PROCESS
+    # Проверяем, существует ли дисплей
+    try:
+        subprocess.run(["xdpyinfo", "-display", display], capture_output=True, check=True)
+        print(f"Xvfb already running on {display}")
+        os.environ["DISPLAY"] = display
+        return display
+    except:
+        pass
+    # Запускаем Xvfb
+    cmd = ["Xvfb", display, "-screen", "0", screen, "-ac"]
+    XVFB_PROCESS = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)  # даём время на запуск
+    os.environ["DISPLAY"] = display
+    return display
 
 # ---------- JavaScript для записи в браузере ----------
 JS_START_RECORDING = """
@@ -113,12 +133,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔄 Подключаюсь к конференции...")
 
+    # Запускаем Xvfb
+    display = ensure_xvfb()
+    await update.message.reply_text(f"🖥️ Виртуальный дисплей: {display}")
+
     try:
         await update.message.reply_text("📡 Запускаю браузер...")
         p = await async_playwright().start()
 
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,   # важно: используем Xvfb, поэтому headless=False
             args=[
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
@@ -130,7 +154,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
         context = await browser.new_context(
-            permissions=["microphone", "camera"],   # исправлено
+            permissions=["microphone", "camera"],
             viewport={"width": 1280, "height": 720}
         )
         page = await context.new_page()
