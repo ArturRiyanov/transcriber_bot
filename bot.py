@@ -4,13 +4,14 @@ import psutil
 import shutil
 import subprocess
 import base64
+import json
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from faster_whisper import WhisperModel
 from playwright.async_api import async_playwright
 
-# ⚠️ ЗАМЕНИТЕ НА НОВЫЙ ТОКЕН (скомпрометирован старый!)
+# ⚠️ ЗАМЕНИТЕ НА НОВЫЙ ТОКЕН ОТ @BotFather
 TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
 AUDIO_WEBM = "recording.webm"
 AUDIO_WAV = "recording.wav"
@@ -23,25 +24,27 @@ active_sessions = {}
 JS_START_RECORDING = """
 async function startRecording() {
     try {
-        // Функция поиска всех аудио-треков из всех RTCPeerConnection
-        function getAllAudioTracks() {
+        function findAllAudioTracks() {
             const tracks = [];
-            // Способ 1: если есть глобальный массив peerConnections
-            if (window.peerConnections && Array.isArray(window.peerConnections)) {
-                for (let pc of window.peerConnections) {
-                    try {
-                        const receivers = pc.getReceivers ? pc.getReceivers() : [];
-                        for (let receiver of receivers) {
-                            if (receiver.track && receiver.track.kind === 'audio') {
-                                tracks.push(receiver.track);
+            const pcCandidates = [];
+            for (let key in window) {
+                try {
+                    const obj = window[key];
+                    if (obj && typeof obj === 'object') {
+                        if (typeof obj.getReceivers === 'function') {
+                            pcCandidates.push(obj);
+                        }
+                        if (Array.isArray(obj)) {
+                            for (let item of obj) {
+                                if (item && typeof item === 'object' && typeof item.getReceivers === 'function') {
+                                    pcCandidates.push(item);
+                                }
                             }
                         }
-                    } catch (e) {}
-                }
+                    }
+                } catch(e) {}
             }
-            // Способ 2: если есть глобальный объект конференции (Яндекс.Телемост)
-            if (window.telemost && window.telemost.peerConnection) {
-                const pc = window.telemost.peerConnection;
+            for (let pc of pcCandidates) {
                 try {
                     const receivers = pc.getReceivers ? pc.getReceivers() : [];
                     for (let receiver of receivers) {
@@ -49,24 +52,49 @@ async function startRecording() {
                             tracks.push(receiver.track);
                         }
                     }
-                } catch (e) {}
+                } catch(e) {}
             }
-            // Способ 3: прямой перебор глобальных объектов (можно добавить при необходимости)
+            const mediaElements = document.querySelectorAll('video, audio');
+            for (let el of mediaElements) {
+                try {
+                    if (el.srcObject && el.srcObject instanceof MediaStream) {
+                        const audioTracks = el.srcObject.getAudioTracks();
+                        for (let track of audioTracks) {
+                            if (!tracks.includes(track)) {
+                                tracks.push(track);
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
+            if (window.telemost && window.telemost.peerConnection) {
+                try {
+                    const pc = window.telemost.peerConnection;
+                    if (typeof pc.getReceivers === 'function') {
+                        const receivers = pc.getReceivers();
+                        for (let receiver of receivers) {
+                            if (receiver.track && receiver.track.kind === 'audio' && !tracks.includes(receiver.track)) {
+                                tracks.push(receiver.track);
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
             return tracks;
         }
 
-        const audioTracks = getAllAudioTracks();
+        const audioTracks = findAllAudioTracks();
         if (audioTracks.length === 0) {
-            throw new Error('Не найдено аудио-треков из WebRTC');
+            throw new Error('Не найдено аудио-треков ни из WebRTC, ни из медиа-элементов');
         }
-        // Создаём MediaStream из найденных треков
-        const stream = new MediaStream(audioTracks);
-        // Проверяем, что треки живы
-        const liveTracks = stream.getAudioTracks().filter(t => t.readyState === 'live');
+        const liveTracks = audioTracks.filter(t => t.readyState === 'live');
         if (liveTracks.length === 0) {
-            throw new Error('Все аудио-треки неактивны (readyState !== live)');
+            throw new Error('Все найденные аудио-треки неактивны (readyState !== live)');
         }
-        // Запускаем MediaRecorder
+        const stream = new MediaStream(liveTracks);
+        if (stream.getAudioTracks().length === 0) {
+            throw new Error('Не удалось создать MediaStream с живыми треками');
+        }
         const options = { mimeType: 'audio/webm;codecs=opus' };
         let recorder;
         try {
@@ -85,8 +113,8 @@ async function startRecording() {
         recorder.start(1000);
         window._recorder = recorder;
         window._recordingComplete = false;
-        window._stream = stream; // сохраняем для остановки
-        return { success: true, message: 'Запись WebRTC аудио запущена, треков: ' + liveTracks.length };
+        window._stream = stream;
+        return { success: true, message: 'Запись запущена, треков: ' + liveTracks.length };
     } catch (err) {
         return { success: false, message: err.message };
     }
@@ -102,11 +130,9 @@ function stopRecordingAndGetData() {
         }
         const recorder = window._recorder;
         recorder.stop();
-        // Останавливаем треки
         if (window._stream) {
             window._stream.getTracks().forEach(track => track.stop());
         }
-        // Ждём завершения onstop
         setTimeout(() => {
             const chunks = window._chunks || [];
             if (chunks.length === 0) {
@@ -129,54 +155,68 @@ function stopRecordingAndGetData() {
 JS_DEBUG_WEBRTC = """
 function debugWebRTC() {
     const info = {};
-    // Проверяем, есть ли window.peerConnections
-    if (window.peerConnections && Array.isArray(window.peerConnections)) {
-        info.peerConnectionsCount = window.peerConnections.length;
-        info.receivers = [];
-        for (let pc of window.peerConnections) {
-            try {
-                const receivers = pc.getReceivers ? pc.getReceivers() : [];
-                for (let receiver of receivers) {
-                    if (receiver.track) {
-                        info.receivers.push({
-                            kind: receiver.track.kind,
-                            state: receiver.track.readyState,
-                            enabled: receiver.track.enabled
-                        });
+    const foundPCs = [];
+    for (let key in window) {
+        try {
+            const obj = window[key];
+            if (obj && typeof obj === 'object') {
+                if (typeof obj.getReceivers === 'function') {
+                    const receivers = obj.getReceivers ? obj.getReceivers() : [];
+                    foundPCs.push({
+                        key: key,
+                        receivers: receivers.map(r => ({
+                            kind: r.track ? r.track.kind : 'unknown',
+                            state: r.track ? r.track.readyState : 'unknown',
+                            enabled: r.track ? r.track.enabled : 'unknown'
+                        }))
+                    });
+                }
+                if (Array.isArray(obj)) {
+                    for (let item of obj) {
+                        if (item && typeof item === 'object' && typeof item.getReceivers === 'function') {
+                            const receivers = item.getReceivers ? item.getReceivers() : [];
+                            foundPCs.push({
+                                key: key + '[' + obj.indexOf(item) + ']',
+                                receivers: receivers.map(r => ({
+                                    kind: r.track ? r.track.kind : 'unknown',
+                                    state: r.track ? r.track.readyState : 'unknown',
+                                    enabled: r.track ? r.track.enabled : 'unknown'
+                                }))
+                            });
+                        }
                     }
                 }
-            } catch (e) {}
-        }
+            }
+        } catch(e) {}
     }
-    // Проверяем наличие telemost
-    if (window.telemost) {
-        info.telemost = 'найден';
-        if (window.telemost.peerConnection) {
-            info.telemostPC = 'найден';
-            try {
-                const receivers = window.telemost.peerConnection.getReceivers ? window.telemost.peerConnection.getReceivers() : [];
-                info.telemostReceivers = [];
-                for (let receiver of receivers) {
-                    if (receiver.track) {
-                        info.telemostReceivers.push({
-                            kind: receiver.track.kind,
-                            state: receiver.track.readyState,
-                            enabled: receiver.track.enabled
-                        });
-                    }
-                }
-            } catch (e) {}
-        }
-    }
-    // Проверяем DOM-элементы
+    info.foundPCs = foundPCs;
+
     const mediaElements = document.querySelectorAll('video, audio');
     info.mediaElementsCount = mediaElements.length;
-    info.mediaElementsWithSrcObject = 0;
+    info.mediaElements = [];
     for (let el of mediaElements) {
-        if (el.srcObject && el.srcObject instanceof MediaStream) {
-            info.mediaElementsWithSrcObject++;
+        const item = { tag: el.tagName, hasSrcObject: !!el.srcObject };
+        if (el.srcObject) {
+            try {
+                item.tracks = el.srcObject.getTracks().map(t => ({
+                    kind: t.kind,
+                    state: t.readyState,
+                    enabled: t.enabled
+                }));
+            } catch(e) {
+                item.tracksError = e.message;
+            }
+        }
+        info.mediaElements.push(item);
+    }
+
+    const knownKeys = ['telemost', 'Telemost', 'conference', 'webrtc', 'peerConnection'];
+    for (let key of knownKeys) {
+        if (window[key]) {
+            info[key] = typeof window[key] === 'object' ? 'exists' : window[key];
         }
     }
+
     return info;
 }
 """
@@ -189,10 +229,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     page = active_sessions[chat_id]['page']
     result = await page.evaluate(JS_DEBUG_WEBRTC)
-    # Преобразуем результат в читаемый текст
-    import json
     text = json.dumps(result, indent=2, ensure_ascii=False)
-    # Если текст слишком длинный, обрежем
     if len(text) > 4000:
         text = text[:4000] + "..."
     await update.message.reply_text(f"📊 Диагностика WebRTC:\n<pre>{text}</pre>", parse_mode='HTML')
@@ -223,6 +260,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     url = update.message.text.strip()
+    print(f"[LOG] Получена ссылка: {url}")
 
     if "telemost.yandex.ru" not in url:
         await update.message.reply_text("❌ Это не ссылка на Яндекс.Телемост.")
@@ -235,7 +273,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Подключаюсь к конференции...")
 
     try:
-        await update.message.reply_text("📡 Запускаю браузер...")
+        print("[LOG] Запуск Playwright...")
         p = await async_playwright().start()
 
         browser = await p.chromium.launch(
@@ -256,38 +294,32 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         page = await context.new_page()
 
+        print("[LOG] Открываю страницу...")
         await update.message.reply_text("🌐 Открываю страницу...")
         await page.goto(url, wait_until="load", timeout=60000)
         await page.wait_for_timeout(5000)
 
+        print("[LOG] Ввожу имя...")
         await update.message.reply_text("✏️ Ввожу имя...")
         name_input = await page.query_selector("input[placeholder*='имя'], input[placeholder*='Ваше'], input[type='text']")
         if name_input:
             await name_input.fill("🤖 Запись встречи (Transcriber)")
             await page.wait_for_timeout(1000)
 
+        print("[LOG] Пытаюсь войти...")
         await update.message.reply_text("🚪 Пытаюсь войти...")
         join_button = await page.query_selector("button:has-text('Подключиться'), button:has-text('Войти'), button:has-text('Присоединиться')")
         if join_button:
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Включаем звук на странице (на случай, если muted)
+        # Включаем звук на странице
         await page.evaluate("""
             document.querySelectorAll('video, audio').forEach(el => el.muted = false);
             document.querySelectorAll('[aria-label*="sound" i], [aria-label*="mute" i]').forEach(el => el.click());
         """)
 
-        await update.message.reply_text("🎙️ Запускаю запись аудио через WebRTC...")
-        result = await page.evaluate(JS_START_RECORDING)
-        if not result.get("success"):
-            await update.message.reply_text(f"❌ Не удалось начать запись: {result.get('message')}")
-            await browser.close()
-            await p.stop()
-            return
-
-        await update.message.reply_text("✅ Запись аудио запущена.")
-
+        # ✅ СОХРАНЯЕМ СЕССИЮ СРАЗУ ПОСЛЕ ВХОДА
         active_sessions[chat_id] = {
             'playwright': p,
             'browser': browser,
@@ -295,8 +327,28 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'page': page,
             'start_time': datetime.now(),
             'update': update,
-            'recording_started': True
+            'recording_started': False,   # пока запись не запущена
         }
+
+        # Теперь запускаем запись
+        print("[LOG] Запуск записи...")
+        await update.message.reply_text("🎙️ Запускаю запись аудио через WebRTC...")
+        result = await page.evaluate(JS_START_RECORDING)
+        print(f"[LOG] Результат записи: {result}")
+
+        if not result.get("success"):
+            await update.message.reply_text(f"❌ Не удалось начать запись: {result.get('message')}")
+            # Сессия уже сохранена, поэтому /debug будет работать
+            screenshot = await page.screenshot()
+            await update.message.reply_photo(
+                photo=screenshot,
+                caption="❌ Запись не удалась, но страница открыта. Используйте /debug для диагностики."
+            )
+            return
+
+        # Если запись успешна, отмечаем это
+        active_sessions[chat_id]['recording_started'] = True
+        await update.message.reply_text("✅ Запись аудио запущена.")
 
         screenshot = await page.screenshot()
         await update.message.reply_photo(
@@ -305,6 +357,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
+        print(f"[LOG] Ошибка: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
         if chat_id in active_sessions:
             await stop_session(chat_id, update=update, notify=False)
@@ -330,6 +383,26 @@ async def stop_session(chat_id, update=None, notify=True):
 
     errors = []
     log_msgs = []
+
+    # Если запись не была запущена, просто закрываем
+    if not session.get('recording_started', False):
+        if update:
+            await update.message.reply_text("ℹ️ Запись не была запущена, закрываю сессию.")
+        # Закрываем браузер и удаляем сессию
+        try:
+            await session['page'].close()
+        except: pass
+        try:
+            await session['context'].close()
+        except: pass
+        try:
+            await session['browser'].close()
+        except: pass
+        try:
+            await session['playwright'].stop()
+        except: pass
+        del active_sessions[chat_id]
+        return False, None, ["Запись не была запущена"]
 
     try:
         if update:
@@ -465,10 +538,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.remove(path)
 
 if __name__ == "__main__":
+    print("[LOG] Запуск бота...")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO, handle_audio))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("debug", debug))
+    print("[LOG] Бот запущен, начинаю polling...")
     app.run_polling(close_loop=False)
