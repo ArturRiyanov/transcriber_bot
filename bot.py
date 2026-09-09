@@ -15,17 +15,20 @@ DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 # Модель Whisper: base (компромисс скорость/качество)
 model = WhisperModel("base", device="cpu", compute_type="int8")
 
-# ---------- Улучшенная функция обработки через DeepSeek ----------
+# ---------- Функция улучшения текста через DeepSeek ----------
 def improve_text(text: str) -> str:
+    """
+    Отправляет текст в DeepSeek для исправления ошибок и пунктуации.
+    Возвращает улучшенный текст или строку с ошибкой.
+    """
     if not text or len(text.strip()) < 5:
         return text
 
     prompt = (
-        "Ты — эксперт по исправлению транскрипций. Ниже дан текст, полученный автоматическим распознаванием речи. "
-        "В нём много ошибок, пропусков, искажённых слов. Твоя задача — восстановить смысл, исправив все ошибки, "
-        "расставить знаки препинания, заглавные буквы, сделать текст грамотным и понятным. "
-        "Если какое-то слово неразборчиво — попробуй догадаться по контексту. Не добавляй информацию, которой нет, "
-        "но исправляй явные ошибки.\n\n"
+        "Ты — профессиональный корректор транскрипций. Исправь все ошибки в тексте, "
+        "расставь знаки препинания, заглавные буквы, сделай текст грамотным и читаемым. "
+        "Если слово неразборчиво — попробуй восстановить по контексту. "
+        "Не добавляй лишней информации, только исправляй.\n\n"
         f"Транскрипция:\n{text}"
     )
 
@@ -34,24 +37,27 @@ def improve_text(text: str) -> str:
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "deepseek-reasoner",
+        "model": "deepseek-chat",   # <-- более стабильная и быстрая модель
         "messages": [
-            {"role": "system", "content": "Ты — корректор транскрипций речи."},
+            {"role": "system", "content": "Ты — помощник, исправляющий транскрипции речи."},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.1,
-        "max_tokens": 2000
+        "temperature": 0.2,
+        "max_tokens": 1500
     }
 
     try:
-        response = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
         improved = data["choices"][0]["message"]["content"].strip()
         return improved
+    except requests.exceptions.Timeout:
+        print("[DeepSeek Error] Timeout")
+        return "⚠️ Превышено время ожидания ответа от DeepSeek. Попробуйте позже."
     except Exception as e:
         print(f"[DeepSeek Error] {e}")
-        return text
+        return f"⚠️ Ошибка DeepSeek: {str(e)}"
 
 # ---------- Команды бота ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -88,7 +94,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Речь не обнаружена.")
             return
 
+        # Отправляем сырую расшифровку
         await update.message.reply_text(f"📝 Сырая расшифровка:\n\n{raw_text}")
+
+        # Улучшаем через DeepSeek
         await update.message.reply_text("🔄 Улучшаю текст через DeepSeek...")
         improved = improve_text(raw_text)
         await update.message.reply_text(f"✨ Улучшенный текст:\n\n{improved}")
@@ -100,7 +109,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(path)
 
 if __name__ == "__main__":
-    print("[LOG] Запуск бота с улучшением через DeepSeek (модель base)...")
+    print("[LOG] Запуск бота с улучшением через DeepSeek (модель base, deepseek-chat)...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO, handle_audio))
