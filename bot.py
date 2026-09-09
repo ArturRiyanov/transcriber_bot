@@ -1,6 +1,5 @@
 import os
 import asyncio
-import time
 import psutil
 import shutil
 from datetime import datetime
@@ -41,7 +40,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📡 Запускаю браузер...")
         p = await async_playwright().start()
         
-        # Запускаем браузер (без указания PULSE_SINK, звук пойдёт в системный sink по умолчанию)
+        # Запускаем браузер — звук пойдёт в системный sink (мы сделали virtual_sink дефолтным)
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -74,10 +73,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Запуск ffmpeg – записываем с системного монитора по умолчанию
+        # Запуск ffmpeg – записываем с монитора virtual_sink
         await update.message.reply_text("🎙️ Запускаю ffmpeg...")
         ffmpeg_cmd = (
-            f"ffmpeg -f pulse -i default.monitor "  # <-- ИСПРАВЛЕНО
+            f"ffmpeg -f pulse -i virtual_sink.monitor "
             f"-acodec pcm_s16le -ar 16000 -ac 1 -y {AUDIO_FILE} 2> ffmpeg_error.log"
         )
         ffmpeg_process = await asyncio.create_subprocess_shell(
@@ -208,19 +207,16 @@ async def stop_session(chat_id, update=None, notify=True):
         if update and notify:
             await update.message.reply_text("🧠 Начинаю транскрипцию...")
         
-        # Проверим, что файл не пустой и содержит звук
-        if os.path.getsize(AUDIO_FILE) < 1000:  # меньше 1 КБ — почти наверняка пусто
-            await update.message.reply_text("⚠️ Аудиофайл слишком маленький (вероятно, тишина). Проверьте звук в конференции.")
-        
+        if os.path.getsize(AUDIO_FILE) < 1000:
+            await update.message.reply_text("⚠️ Аудиофайл очень маленький (вероятно, тишина). Проверьте звук в конференции.")
+
         segments, info = model.transcribe(AUDIO_FILE, beam_size=5)
         transcription = " ".join([seg.text for seg in segments])
         log_msgs.append("✅ Транскрипция завершена.")
 
-        # Сохраняем текст в файл
         with open(TXT_FILE, "w", encoding="utf-8") as f:
             f.write(transcription)
 
-        # Сохраняем копии с датой на сервере
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         audio_saved = f"recording_{timestamp}.wav"
         txt_saved = f"transcript_{timestamp}.txt"
@@ -228,13 +224,11 @@ async def stop_session(chat_id, update=None, notify=True):
         shutil.copy(TXT_FILE, txt_saved)
 
         if update and notify:
-            # Отправляем логи
             for msg in log_msgs:
                 await update.message.reply_text(msg)
             if errors:
                 await update.message.reply_text(f"⚠️ Ошибки:\n{chr(10).join(errors)}")
 
-            # Отправляем аудиофайл
             if os.path.exists(AUDIO_FILE) and os.path.getsize(AUDIO_FILE) > 0:
                 with open(AUDIO_FILE, "rb") as f:
                     await update.message.reply_audio(
@@ -243,7 +237,6 @@ async def stop_session(chat_id, update=None, notify=True):
                         caption="🎧 Аудиозапись встречи"
                     )
 
-            # Отправляем текстовый файл (всегда)
             if os.path.exists(TXT_FILE):
                 with open(TXT_FILE, "rb") as f:
                     await update.message.reply_document(
@@ -252,11 +245,9 @@ async def stop_session(chat_id, update=None, notify=True):
                         caption="📝 Расшифровка встречи"
                     )
 
-            # Если транскрипция пустая – предупреждаем
             if not transcription.strip():
                 await update.message.reply_text("⚠️ Внимание: расшифровка пуста. Возможно, в записи нет речи или аудио слишком тихое.")
 
-            # Удаляем временные файлы (копии с датой остаются на сервере)
             os.remove(AUDIO_FILE)
             os.remove(TXT_FILE)
 
@@ -278,7 +269,6 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Критическая ошибка: {e}")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Обработка загруженных аудио (для совместимости)
     await update.message.reply_text("🎧 Секунду...")
     file = await update.message.effective_attachment.get_file()
     path = "temp_audio." + file.file_path.split(".")[-1]
