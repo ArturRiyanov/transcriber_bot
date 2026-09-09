@@ -1,0 +1,3 @@
+faster-whisper
+python-telegram-bot
+playwright
