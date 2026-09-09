@@ -10,7 +10,8 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 from faster_whisper import WhisperModel
 from playwright.async_api import async_playwright
 
-TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
+# ⚠️ ЗАМЕНИТЕ НА НОВЫЙ ТОКЕН (скомпрометирован старый!)
+TOKEN = "НОВЫЙ_ТОКЕН_ОТ_BOTFATHER"
 AUDIO_WEBM = "recording.webm"
 AUDIO_WAV = "recording.wav"
 TXT_FILE = "transcript.txt"
@@ -18,25 +19,54 @@ TXT_FILE = "transcript.txt"
 model = WhisperModel("base", device="cpu", compute_type="int8")
 active_sessions = {}
 
-# ---------- JavaScript для записи через Web Audio (исправленный) ----------
+# ---------- JavaScript для записи через WebRTC ----------
 JS_START_RECORDING = """
 async function startRecording() {
     try {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const dest = audioCtx.createMediaStreamDestination();
-        const mediaElements = document.querySelectorAll('video, audio');
-        let connected = 0;
-        for (let el of mediaElements) {
-            try {
-                const source = audioCtx.createMediaElementSource(el);
-                source.connect(dest);
-                connected++;
-            } catch (e) {}
+        // Функция поиска всех аудио-треков из всех RTCPeerConnection
+        function getAllAudioTracks() {
+            const tracks = [];
+            // Способ 1: если есть глобальный массив peerConnections
+            if (window.peerConnections && Array.isArray(window.peerConnections)) {
+                for (let pc of window.peerConnections) {
+                    try {
+                        const receivers = pc.getReceivers ? pc.getReceivers() : [];
+                        for (let receiver of receivers) {
+                            if (receiver.track && receiver.track.kind === 'audio') {
+                                tracks.push(receiver.track);
+                            }
+                        }
+                    } catch (e) {}
+                }
+            }
+            // Способ 2: если есть глобальный объект конференции (Яндекс.Телемост)
+            if (window.telemost && window.telemost.peerConnection) {
+                const pc = window.telemost.peerConnection;
+                try {
+                    const receivers = pc.getReceivers ? pc.getReceivers() : [];
+                    for (let receiver of receivers) {
+                        if (receiver.track && receiver.track.kind === 'audio') {
+                            tracks.push(receiver.track);
+                        }
+                    }
+                } catch (e) {}
+            }
+            // Способ 3: прямой перебор глобальных объектов (можно добавить при необходимости)
+            return tracks;
         }
-        if (connected === 0) {
-            throw new Error('Не найдено аудио-элементов для захвата');
+
+        const audioTracks = getAllAudioTracks();
+        if (audioTracks.length === 0) {
+            throw new Error('Не найдено аудио-треков из WebRTC');
         }
-        const stream = dest.stream;
+        // Создаём MediaStream из найденных треков
+        const stream = new MediaStream(audioTracks);
+        // Проверяем, что треки живы
+        const liveTracks = stream.getAudioTracks().filter(t => t.readyState === 'live');
+        if (liveTracks.length === 0) {
+            throw new Error('Все аудио-треки неактивны (readyState !== live)');
+        }
+        // Запускаем MediaRecorder
         const options = { mimeType: 'audio/webm;codecs=opus' };
         let recorder;
         try {
@@ -52,12 +82,11 @@ async function startRecording() {
             window._chunks = chunks;
             window._recordingComplete = true;
         };
-        // Запускаем с интервалом 1 секунда для сбора чанков
         recorder.start(1000);
         window._recorder = recorder;
-        window._audioCtx = audioCtx;
         window._recordingComplete = false;
-        return { success: true, message: 'Запись аудио запущена, подключено: ' + connected };
+        window._stream = stream; // сохраняем для остановки
+        return { success: true, message: 'Запись WebRTC аудио запущена, треков: ' + liveTracks.length };
     } catch (err) {
         return { success: false, message: err.message };
     }
@@ -72,16 +101,12 @@ function stopRecordingAndGetData() {
             return;
         }
         const recorder = window._recorder;
-        // Останавливаем рекордер (это вызовет onstop, который сохранит чанки)
         recorder.stop();
         // Останавливаем треки
-        if (recorder.stream) {
-            recorder.stream.getTracks().forEach(track => track.stop());
+        if (window._stream) {
+            window._stream.getTracks().forEach(track => track.stop());
         }
-        if (window._audioCtx) {
-            window._audioCtx.close();
-        }
-        // Ждём немного, чтобы onstop успел обработать данные
+        // Ждём завершения onstop
         setTimeout(() => {
             const chunks = window._chunks || [];
             if (chunks.length === 0) {
@@ -95,10 +120,82 @@ function stopRecordingAndGetData() {
                 resolve({ success: true, data: base64data, size: blob.size });
             };
             reader.readAsDataURL(blob);
-        }, 1500); // даём время на завершение
+        }, 1500);
     });
 }
 """
+
+# ---------- Диагностика WebRTC ----------
+JS_DEBUG_WEBRTC = """
+function debugWebRTC() {
+    const info = {};
+    // Проверяем, есть ли window.peerConnections
+    if (window.peerConnections && Array.isArray(window.peerConnections)) {
+        info.peerConnectionsCount = window.peerConnections.length;
+        info.receivers = [];
+        for (let pc of window.peerConnections) {
+            try {
+                const receivers = pc.getReceivers ? pc.getReceivers() : [];
+                for (let receiver of receivers) {
+                    if (receiver.track) {
+                        info.receivers.push({
+                            kind: receiver.track.kind,
+                            state: receiver.track.readyState,
+                            enabled: receiver.track.enabled
+                        });
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+    // Проверяем наличие telemost
+    if (window.telemost) {
+        info.telemost = 'найден';
+        if (window.telemost.peerConnection) {
+            info.telemostPC = 'найден';
+            try {
+                const receivers = window.telemost.peerConnection.getReceivers ? window.telemost.peerConnection.getReceivers() : [];
+                info.telemostReceivers = [];
+                for (let receiver of receivers) {
+                    if (receiver.track) {
+                        info.telemostReceivers.push({
+                            kind: receiver.track.kind,
+                            state: receiver.track.readyState,
+                            enabled: receiver.track.enabled
+                        });
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+    // Проверяем DOM-элементы
+    const mediaElements = document.querySelectorAll('video, audio');
+    info.mediaElementsCount = mediaElements.length;
+    info.mediaElementsWithSrcObject = 0;
+    for (let el of mediaElements) {
+        if (el.srcObject && el.srcObject instanceof MediaStream) {
+            info.mediaElementsWithSrcObject++;
+        }
+    }
+    return info;
+}
+"""
+
+# ---------- Команда диагностики ----------
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in active_sessions:
+        await update.message.reply_text("❌ Нет активной сессии. Сначала отправьте ссылку.")
+        return
+    page = active_sessions[chat_id]['page']
+    result = await page.evaluate(JS_DEBUG_WEBRTC)
+    # Преобразуем результат в читаемый текст
+    import json
+    text = json.dumps(result, indent=2, ensure_ascii=False)
+    # Если текст слишком длинный, обрежем
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    await update.message.reply_text(f"📊 Диагностика WebRTC:\n<pre>{text}</pre>", parse_mode='HTML')
 
 # ---------- Вспомогательная функция ----------
 def convert_webm_to_wav(webm_path, wav_path):
@@ -114,12 +211,13 @@ def convert_webm_to_wav(webm_path, wav_path):
         raise RuntimeError(f"ffmpeg conversion error: {result.stderr}")
     return wav_path
 
-# ---------- Команды бота (без изменений) ----------
+# ---------- Команды бота ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Отправь ссылку на конференцию Яндекс.Телемост.\n"
         "Когда встреча закончится — отправь /stop.\n"
-        "Я запишу аудио через Web Audio API и пришлю расшифровку."
+        "Я запишу аудио через WebRTC и пришлю расшифровку.\n"
+        "Также доступна команда /debug для диагностики WebRTC."
     )
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,12 +272,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
+        # Включаем звук на странице (на случай, если muted)
         await page.evaluate("""
             document.querySelectorAll('video, audio').forEach(el => el.muted = false);
             document.querySelectorAll('[aria-label*="sound" i], [aria-label*="mute" i]').forEach(el => el.click());
         """)
 
-        await update.message.reply_text("🎙️ Запускаю запись аудио через Web Audio...")
+        await update.message.reply_text("🎙️ Запускаю запись аудио через WebRTC...")
         result = await page.evaluate(JS_START_RECORDING)
         if not result.get("success"):
             await update.message.reply_text(f"❌ Не удалось начать запись: {result.get('message')}")
@@ -371,4 +470,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO, handle_audio))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("debug", debug))
     app.run_polling(close_loop=False)
