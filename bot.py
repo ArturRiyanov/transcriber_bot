@@ -11,7 +11,7 @@ from faster_whisper import WhisperModel
 from playwright.async_api import async_playwright
 
 # ⚠️ ЗАМЕНИТЕ НА НОВЫЙ ТОКЕН (скомпрометирован старый!)
-TOKEN = "НОВЫЙ_ТОКЕН_ОТ_BOTFATHER"
+TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
 AUDIO_WEBM = "recording.webm"
 AUDIO_WAV = "recording.wav"
 TXT_FILE = "transcript.txt"
