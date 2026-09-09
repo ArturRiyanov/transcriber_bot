@@ -41,8 +41,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📡 Запускаю браузер...")
         p = await async_playwright().start()
         
-        # Запускаем браузер с переменной окружения PULSE_SINK,
-        # чтобы звук шёл в виртуальное устройство
+        # Запускаем браузер (без указания PULSE_SINK, звук пойдёт в системный sink по умолчанию)
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -51,8 +50,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "--no-sandbox",
                 "--autoplay-policy=no-user-gesture-required",
                 "--use-fake-ui-for-media-stream",
-            ],
-            env={"PULSE_SINK": "virtual_sink"}  # <-- Ключевое изменение
+            ]
         )
         context = await browser.new_context(
             permissions=["microphone", "camera"],
@@ -76,10 +74,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Запуск ffmpeg – записываем с монитора виртуального sink
+        # Запуск ffmpeg – записываем с системного монитора по умолчанию
         await update.message.reply_text("🎙️ Запускаю ffmpeg...")
         ffmpeg_cmd = (
-            f"ffmpeg -f pulse -i virtual_sink.monitor "  # <-- Изменено
+            f"ffmpeg -f pulse -i default.monitor "  # <-- ИСПРАВЛЕНО
             f"-acodec pcm_s16le -ar 16000 -ac 1 -y {AUDIO_FILE} 2> ffmpeg_error.log"
         )
         ffmpeg_process = await asyncio.create_subprocess_shell(
@@ -90,7 +88,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await asyncio.sleep(2)
-        if os.path.exists(AUDIO_FILE):
+        if os.path.exists(AUDIO_FILE) and os.path.getsize(AUDIO_FILE) > 0:
             await update.message.reply_text("✅ ffmpeg запущен, файл записи создан.")
         else:
             error_log = ""
@@ -195,7 +193,7 @@ async def stop_session(chat_id, update=None, notify=True):
     if not os.path.exists(AUDIO_FILE) or os.path.getsize(AUDIO_FILE) == 0:
         errors.append("Файл записи не найден или пуст.")
         if update and notify:
-            await update.message.reply_text("⚠️ Аудиофайл не найден. Запись не удалась.")
+            await update.message.reply_text("⚠️ Аудиофайл не найден или пуст. Запись не удалась.")
             if os.path.exists("ffmpeg_error.log"):
                 with open("ffmpeg_error.log", "r") as f:
                     error_text = f.read()
@@ -209,6 +207,11 @@ async def stop_session(chat_id, update=None, notify=True):
     try:
         if update and notify:
             await update.message.reply_text("🧠 Начинаю транскрипцию...")
+        
+        # Проверим, что файл не пустой и содержит звук
+        if os.path.getsize(AUDIO_FILE) < 1000:  # меньше 1 КБ — почти наверняка пусто
+            await update.message.reply_text("⚠️ Аудиофайл слишком маленький (вероятно, тишина). Проверьте звук в конференции.")
+        
         segments, info = model.transcribe(AUDIO_FILE, beam_size=5)
         transcription = " ".join([seg.text for seg in segments])
         log_msgs.append("✅ Транскрипция завершена.")
@@ -232,7 +235,7 @@ async def stop_session(chat_id, update=None, notify=True):
                 await update.message.reply_text(f"⚠️ Ошибки:\n{chr(10).join(errors)}")
 
             # Отправляем аудиофайл
-            if os.path.exists(AUDIO_FILE):
+            if os.path.exists(AUDIO_FILE) and os.path.getsize(AUDIO_FILE) > 0:
                 with open(AUDIO_FILE, "rb") as f:
                     await update.message.reply_audio(
                         audio=f,
