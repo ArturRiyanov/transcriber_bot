@@ -40,13 +40,20 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("📡 Запускаю браузер...")
         p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True, args=[
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--autoplay-policy=no-user-gesture-required",
-            "--use-fake-ui-for-media-stream",
-        ])
+        
+        # Запускаем браузер с переменной окружения PULSE_SINK,
+        # чтобы звук шёл в виртуальное устройство
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--autoplay-policy=no-user-gesture-required",
+                "--use-fake-ui-for-media-stream",
+            ],
+            env={"PULSE_SINK": "virtual_sink"}  # <-- Ключевое изменение
+        )
         context = await browser.new_context(
             permissions=["microphone", "camera"],
             viewport={"width": 1280, "height": 720}
@@ -69,10 +76,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Запуск ffmpeg (используем default – системный звук)
+        # Запуск ffmpeg – записываем с монитора виртуального sink
         await update.message.reply_text("🎙️ Запускаю ffmpeg...")
         ffmpeg_cmd = (
-            f"ffmpeg -f pulse -i default "
+            f"ffmpeg -f pulse -i virtual_sink.monitor "  # <-- Изменено
             f"-acodec pcm_s16le -ar 16000 -ac 1 -y {AUDIO_FILE} 2> ffmpeg_error.log"
         )
         ffmpeg_process = await asyncio.create_subprocess_shell(
