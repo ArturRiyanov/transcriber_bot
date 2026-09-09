@@ -3,7 +3,6 @@ import asyncio
 import psutil
 import shutil
 import subprocess
-import re
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -17,40 +16,18 @@ TXT_FILE = "transcript.txt"
 model = WhisperModel("base", device="cpu", compute_type="int8")
 active_sessions = {}
 
-# ---------- Работа с PulseAudio ----------
-SINK_NAME = "telegram_bot_sink"  # Имя виртуального sink
-
-def ensure_pulse_sink(sink_name=SINK_NAME):
-    """Создаёт виртуальный null-sink, если его нет, и возвращает его имя."""
+def get_pulse_source():
+    """Возвращает имя текущего default source PulseAudio."""
     try:
-        # Проверяем, существует ли уже sink
-        result = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True, check=False)
-        if sink_name in result.stdout:
-            print(f"✅ Sink {sink_name} уже существует.")
-            return sink_name
-
-        # Создаём null-sink
-        subprocess.run(["pactl", "load-module", "module-null-sink", f"sink_name={sink_name}"], check=True)
-        print(f"✅ Sink {sink_name} создан.")
-        return sink_name
-    except Exception as e:
-        print(f"❌ Ошибка создания sink: {e}")
-        return None
-
-def cleanup_pulse_sink(sink_name=SINK_NAME):
-    """Удаляет созданный модуль null-sink (если он существует)."""
-    try:
-        result = subprocess.run(["pactl", "list", "short", "modules"], capture_output=True, text=True, check=False)
+        result = subprocess.run(["pactl", "info"], capture_output=True, text=True, check=True)
         for line in result.stdout.splitlines():
-            if "module-null-sink" in line and f"sink_name={sink_name}" in line:
-                mod_id = line.split()[0]
-                subprocess.run(["pactl", "unload-module", mod_id], check=False)
-                print(f"✅ Модуль sink {sink_name} выгружен.")
-                break
-    except Exception as e:
-        print(f"⚠️ Ошибка при очистке sink: {e}")
+            if "Default Source:" in line:
+                return line.split(":")[1].strip()
+    except Exception:
+        pass
+    # fallback, если не удалось определить
+    return "virtual_sink.monitor"
 
-# ---------- Команды бота ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Отправь ссылку на конференцию Яндекс.Телемост.\n"
@@ -70,12 +47,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Закрываю старую сессию...")
         await stop_session(chat_id, update=update, notify=False)
 
-    # --- Настройка PulseAudio sink ---
-    sink_name = ensure_pulse_sink()
-    if not sink_name:
-        await update.message.reply_text("❌ Не удалось настроить звуковое устройство. Убедитесь, что PulseAudio запущен.")
-        return
-
     await update.message.reply_text("🔄 Подключаюсь к конференции...")
 
     try:
@@ -84,13 +55,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         browser = await p.chromium.launch(
             headless=True,
-            env={"PULSE_SINK": sink_name},   # перенаправляем звук браузера в наш sink
             args=[
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--no-sandbox",
                 "--autoplay-policy=no-user-gesture-required",
                 "--use-fake-ui-for-media-stream",
+                "--enable-audio",          # гарантируем включение звука
             ]
         )
         context = await browser.new_context(
@@ -115,11 +86,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # --- Запуск ffmpeg для записи с монитора нашего sink ---
-        await update.message.reply_text("🎙️ Запускаю ffmpeg...")
+        # Принудительно включаем звук на странице (на случай, если он выключен)
+        await page.evaluate("""
+            document.querySelectorAll('video, audio').forEach(el => el.muted = false);
+            document.querySelectorAll('[aria-label*="sound" i], [aria-label*="mute" i]').forEach(el => el.click());
+        """)
+
+        source = get_pulse_source()
+        await update.message.reply_text(f"🎙️ Запускаю ffmpeg (источник: {source})...")
         ffmpeg_cmd = (
-            f"ffmpeg -f pulse -i {sink_name}.monitor "
-            f"-af volume=5 "  # усиление на всякий случай
+            f"ffmpeg -f pulse -i {source} "
+            f"-af volume=10 "
             f"-acodec pcm_s16le -ar 16000 -ac 1 -y {AUDIO_FILE} 2> ffmpeg_error.log"
         )
         ffmpeg_process = await asyncio.create_subprocess_shell(
@@ -139,7 +116,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     error_log = f.read()[:500]
             await update.message.reply_text(f"⚠️ ffmpeg не создал файл. Ошибка: {error_log if error_log else 'неизвестна'}")
 
-        # Сохраняем сессию (добавляем sink_name для очистки)
         active_sessions[chat_id] = {
             'playwright': p,
             'browser': browser,
@@ -148,10 +124,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'ffmpeg': ffmpeg_process,
             'start_time': datetime.now(),
             'update': update,
-            'cmd': ffmpeg_cmd,
-            'sink_name': sink_name   # запоминаем, чтобы потом удалить
+            'cmd': ffmpeg_cmd
         }
-        await update.message.reply_text(f"🔍 Сессия сохранена для chat_id={chat_id}")
 
         screenshot = await page.screenshot()
         await update.message.reply_photo(
@@ -172,8 +146,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await p.stop()
             except:
                 pass
-            # очистка sink, если создали
-            cleanup_pulse_sink()
 
 async def stop_session(chat_id, update=None, notify=True):
     if chat_id not in active_sessions:
@@ -188,7 +160,7 @@ async def stop_session(chat_id, update=None, notify=True):
     errors = []
     log_msgs = []
 
-    # 1. Остановка ffmpeg
+    # Остановка ffmpeg
     try:
         ffmpeg_proc = session.get('ffmpeg')
         if ffmpeg_proc:
@@ -212,7 +184,7 @@ async def stop_session(chat_id, update=None, notify=True):
     except Exception as e:
         errors.append(f"ffmpeg stop error: {e}")
 
-    # 2. Закрытие браузера и Playwright
+    # Закрытие браузера и Playwright
     try:
         await session['page'].close()
     except Exception as e:
@@ -230,19 +202,13 @@ async def stop_session(chat_id, update=None, notify=True):
     except Exception as e:
         errors.append(f"playwright.stop(): {e}")
 
-    # 3. Удаление виртуального sink
-    sink_name = session.get('sink_name')
-    if sink_name:
-        cleanup_pulse_sink(sink_name)
-
     if session.get('start_time'):
         duration = datetime.now() - session['start_time']
         log_msgs.append(f"⏱️ Длительность: {duration.seconds//60} мин {duration.seconds%60} сек")
 
-    # Удаляем сессию
     del active_sessions[chat_id]
 
-    # 4. Проверка файла записи
+    # Проверка файла записи
     if not os.path.exists(AUDIO_FILE) or os.path.getsize(AUDIO_FILE) == 0:
         errors.append("Файл записи не найден или пуст.")
         if update and notify:
@@ -256,7 +222,7 @@ async def stop_session(chat_id, update=None, notify=True):
     size = os.path.getsize(AUDIO_FILE)
     log_msgs.append(f"📁 Размер файла: {size} байт")
 
-    # 5. Транскрипция
+    # Транскрипция
     try:
         if update and notify:
             await update.message.reply_text("🧠 Начинаю транскрипцию...")
@@ -332,12 +298,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📝 Расшифровка:\n\n{text}")
     os.remove(path)
 
-# ---------- Основной запуск ----------
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO, handle_audio))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
-
     app.run_polling(close_loop=False)
