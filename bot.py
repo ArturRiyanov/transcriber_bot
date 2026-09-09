@@ -21,23 +21,19 @@ active_sessions = {}
 JS_START_RECORDING = """
 async function startRecording() {
     try {
-        // Запрашиваем аудио-поток (системный звук)
         const stream = await navigator.mediaDevices.getDisplayMedia({
             audio: true,
             video: false
         });
-        // Проверяем, есть ли аудио-дорожка
         const audioTracks = stream.getAudioTracks();
         if (audioTracks.length === 0) {
             throw new Error('Нет аудио-дорожки');
         }
-        // Создаём MediaRecorder с кодеком Opus в контейнере WebM
         const options = { mimeType: 'audio/webm;codecs=opus' };
         const recorder = new MediaRecorder(stream, options);
         const chunks = [];
         recorder.ondataavailable = e => chunks.push(e.data);
         recorder.onstop = () => {
-            // Сохраняем blob в глобальную переменную для последующего извлечения
             const blob = new Blob(chunks, { type: 'audio/webm' });
             window._recordingBlob = blob;
             window._recordingComplete = true;
@@ -61,7 +57,6 @@ function stopRecordingAndGetData() {
             return;
         }
         window._recorder.onstop = () => {
-            // Ждём завершения обработки
             const blob = window._recordingBlob;
             if (!blob) {
                 resolve({ success: false, message: 'Blob не создан' });
@@ -75,7 +70,6 @@ function stopRecordingAndGetData() {
             reader.readAsDataURL(blob);
         };
         window._recorder.stop();
-        // Также останавливаем все треки, чтобы освободить ресурсы
         if (window._recorder.stream) {
             window._recorder.stream.getTracks().forEach(track => track.stop());
         }
@@ -85,7 +79,6 @@ function stopRecordingAndGetData() {
 
 # ---------- Вспомогательные функции ----------
 def convert_webm_to_wav(webm_path, wav_path):
-    """Конвертирует WebM (Opus) в WAV (PCM 16 кГц, моно) с помощью ffmpeg."""
     cmd = [
         "ffmpeg", "-i", webm_path,
         "-acodec", "pcm_s16le",
@@ -133,11 +126,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "--autoplay-policy=no-user-gesture-required",
                 "--use-fake-ui-for-media-stream",
                 "--enable-audio",
-                "--auto-select-desktop-capture-source=0",  # автоматически выбираем экран для захвата
+                "--auto-select-desktop-capture-source=0",
             ]
         )
         context = await browser.new_context(
-            permissions=["microphone", "camera", "display-capture"],  # разрешаем захват экрана
+            permissions=["microphone", "camera"],   # исправлено
             viewport={"width": 1280, "height": 720}
         )
         page = await context.new_page()
@@ -158,13 +151,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Принудительно включаем звук на странице
         await page.evaluate("""
             document.querySelectorAll('video, audio').forEach(el => el.muted = false);
             document.querySelectorAll('[aria-label*="sound" i], [aria-label*="mute" i]').forEach(el => el.click());
         """)
 
-        # Запускаем запись аудио в браузере
         await update.message.reply_text("🎙️ Запускаю запись аудио через браузер...")
         result = await page.evaluate(JS_START_RECORDING)
         if not result.get("success"):
@@ -175,7 +166,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("✅ Запись аудио запущена.")
 
-        # Сохраняем сессию
         active_sessions[chat_id] = {
             'playwright': p,
             'browser': browser,
@@ -219,7 +209,6 @@ async def stop_session(chat_id, update=None, notify=True):
     errors = []
     log_msgs = []
 
-    # Остановка записи и получение данных
     try:
         if update:
             await update.message.reply_text("⏹️ Останавливаю запись...")
@@ -227,15 +216,12 @@ async def stop_session(chat_id, update=None, notify=True):
         result = await page.evaluate(JS_STOP_RECORDING)
         if not result.get("success"):
             errors.append(f"Ошибка остановки записи: {result.get('message')}")
-            # всё равно продолжаем
         else:
             audio_base64 = result.get("data")
             if audio_base64:
-                # Сохраняем WebM-файл
                 with open(AUDIO_WEBM, "wb") as f:
                     f.write(base64.b64decode(audio_base64))
                 log_msgs.append(f"✅ Аудио получено, размер: {result.get('size')} байт")
-                # Конвертируем в WAV
                 if update:
                     await update.message.reply_text("🔄 Конвертирую аудио в WAV...")
                 convert_webm_to_wav(AUDIO_WEBM, AUDIO_WAV)
@@ -246,7 +232,6 @@ async def stop_session(chat_id, update=None, notify=True):
     except Exception as e:
         errors.append(f"Ошибка при остановке записи: {e}")
 
-    # Закрытие браузера и Playwright
     try:
         await session['page'].close()
     except Exception as e:
@@ -270,7 +255,6 @@ async def stop_session(chat_id, update=None, notify=True):
 
     del active_sessions[chat_id]
 
-    # Проверка файла WAV
     if not os.path.exists(AUDIO_WAV) or os.path.getsize(AUDIO_WAV) == 0:
         errors.append("Файл WAV не найден или пуст.")
         if update and notify:
@@ -280,7 +264,6 @@ async def stop_session(chat_id, update=None, notify=True):
     size = os.path.getsize(AUDIO_WAV)
     log_msgs.append(f"📁 Размер WAV: {size} байт")
 
-    # Транскрипция
     try:
         if update and notify:
             await update.message.reply_text("🧠 Начинаю транскрипцию...")
