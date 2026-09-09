@@ -1,5 +1,4 @@
 import os
-import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from faster_whisper import WhisperModel
@@ -9,14 +8,23 @@ TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
 
 model = WhisperModel("base", device="cpu", compute_type="int8")
 
+# Хранилище активных браузеров: {chat_id: {'browser': ..., 'context': ..., 'page': ...}}
+active_sessions = {}
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Отправь ссылку на конференцию Яндекс.Телемост (или голосовое для транскрибации)")
+    await update.message.reply_text("Привет! Отправь ссылку на конференцию Яндекс.Телемост (или голосовое для транскрибации). Когда закончишь — отправь /stop.")
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     url = update.message.text.strip()
+
     if "telemost.yandex.ru" not in url:
         await update.message.reply_text("Это не ссылка на Яндекс.Телемост. Проверь, пожалуйста.")
         return
+
+    # Если уже есть активная сессия — закроем старую
+    if chat_id in active_sessions:
+        await stop_session(chat_id)
 
     await update.message.reply_text("Подключаюсь к конференции... Это может занять 20-30 секунд.")
 
@@ -38,34 +46,46 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await page.goto(url, wait_until="load", timeout=60000)
             await page.wait_for_timeout(5000)
 
-            # --- Логика входа в Телемост ---
-            # 1. Ищем поле ввода имени (input) и вводим имя
+            # Логика входа
             name_input = await page.query_selector("input[placeholder*='имя'], input[placeholder*='Ваше'], input[type='text']")
             if name_input:
                 await name_input.fill("Transcriber Bot")
                 await page.wait_for_timeout(1000)
 
-            # 2. Ищем кнопку "Подключиться" или "Войти" и кликаем
             join_button = await page.query_selector("button:has-text('Подключиться'), button:has-text('Войти'), button:has-text('Присоединиться')")
             if join_button:
                 await join_button.click()
                 await page.wait_for_timeout(5000)
-            else:
-                # Если кнопка не найдена, возможно, это страница с "Принять условия" или что-то похожее
-                # Попробуем найти любую основную кнопку в центре
-                any_button = await page.query_selector("button[type='submit'], button.btn-primary, button:has-text('Продолжить')")
-                if any_button:
-                    await any_button.click()
-                    await page.wait_for_timeout(5000)
 
-            # 3. Скриншот после попытки входа (может быть комната ожидания или уже конференция)
+            # Сохраняем сессию
+            active_sessions[chat_id] = {'browser': browser, 'context': context, 'page': page}
+
+            # Отправляем подтверждение
             screenshot = await page.screenshot()
-            await update.message.reply_photo(photo=screenshot, caption="Я попытался войти в конференцию. Если попал в комнату ожидания, организатор должен меня впустить.")
+            await update.message.reply_photo(photo=screenshot, caption="Я вошёл в конференцию! Остаюсь здесь, пока ты не отправишь /stop.")
 
         except Exception as e:
             await update.message.reply_text(f"Ошибка подключения: {e}")
-        finally:
             await browser.close()
+            if chat_id in active_sessions:
+                del active_sessions[chat_id]
+
+async def stop_session(chat_id):
+    """Закрываем браузер для конкретного чата"""
+    if chat_id in active_sessions:
+        session = active_sessions[chat_id]
+        await session['browser'].close()
+        del active_sessions[chat_id]
+        return True
+    return False
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    closed = await stop_session(chat_id)
+    if closed:
+        await update.message.reply_text("Я вышел из конференции. Спасибо!")
+    else:
+        await update.message.reply_text("Нет активной конференции для остановки.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Секунду, слушаю и переписываю...")
@@ -80,5 +100,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO, handle_audio))
-app.add_handler(MessageHandler(filters.COMMAND, start))
+app.add_handler(MessageHandler(filters.COMMAND & filters.Text(["start"]), start))
+app.add_handler(MessageHandler(filters.COMMAND & filters.Text(["stop"]), stop))
 app.run_polling()
