@@ -8,7 +8,6 @@ TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
 
 model = WhisperModel("base", device="cpu", compute_type="int8")
 
-# Хранилище активных сессий: {chat_id: {'playwright': obj, 'browser': obj, 'context': obj, 'page': obj}}
 active_sessions = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -22,13 +21,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Это не ссылка на Яндекс.Телемост. Проверь, пожалуйста.")
         return
 
-    # Если уже есть активная сессия — закроем старую
     if chat_id in active_sessions:
         await stop_session(chat_id)
 
     await update.message.reply_text("Подключаюсь к конференции... Это может занять 20-30 секунд.")
 
-    # Запускаем Playwright вручную, чтобы он не закрылся после обработчика
     try:
         p = await async_playwright().start()
         browser = await p.chromium.launch(headless=True, args=[
@@ -47,19 +44,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await page.goto(url, wait_until="load", timeout=60000)
         await page.wait_for_timeout(5000)
 
-        # Ввод имени
         name_input = await page.query_selector("input[placeholder*='имя'], input[placeholder*='Ваше'], input[type='text']")
         if name_input:
             await name_input.fill("Transcriber Bot")
             await page.wait_for_timeout(1000)
 
-        # Клик по кнопке входа
         join_button = await page.query_selector("button:has-text('Подключиться'), button:has-text('Войти'), button:has-text('Присоединиться')")
         if join_button:
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Сохраняем сессию
         active_sessions[chat_id] = {
             'playwright': p,
             'browser': browser,
@@ -67,17 +61,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'page': page
         }
 
-        # Отправляем подтверждение
         screenshot = await page.screenshot()
         await update.message.reply_photo(photo=screenshot, caption="Я вошёл в конференцию! Остаюсь здесь, пока ты не отправишь /stop.")
 
     except Exception as e:
-        # Если что-то пошло не так, закрываем всё
         await update.message.reply_text(f"Ошибка подключения: {e}")
+        # Попытка закрыть всё, если что-то упало
         if chat_id in active_sessions:
             await stop_session(chat_id)
         else:
-            # Закрываем браузер вручную
             try:
                 await browser.close()
             except:
@@ -88,28 +80,37 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 async def stop_session(chat_id):
-    """Закрываем браузер и Playwright для конкретного чата"""
-    if chat_id in active_sessions:
-        session = active_sessions[chat_id]
-        try:
-            await session['browser'].close()
-        except:
-            pass
-        try:
-            await session['playwright'].stop()
-        except:
-            pass
-        del active_sessions[chat_id]
-        return True
-    return False
+    """Закрываем всё для конкретного чата"""
+    if chat_id not in active_sessions:
+        return False
+    session = active_sessions[chat_id]
+    # Закрываем страницу, контекст, браузер и playwright
+    try:
+        await session['page'].close()
+    except:
+        pass
+    try:
+        await session['context'].close()
+    except:
+        pass
+    try:
+        await session['browser'].close()
+    except:
+        pass
+    try:
+        await session['playwright'].stop()
+    except:
+        pass
+    del active_sessions[chat_id]
+    return True
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     closed = await stop_session(chat_id)
     if closed:
-        await update.message.reply_text("Я вышел из конференции. Спасибо!")
+        await update.message.reply_text("✅ Я вышел из конференции.")
     else:
-        await update.message.reply_text("Нет активной конференции для остановки.")
+        await update.message.reply_text("❌ Нет активной конференции для остановки.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Секунду, слушаю и переписываю...")
