@@ -11,42 +11,65 @@ from faster_whisper import WhisperModel
 from playwright.async_api import async_playwright
 
 TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
-VIDEO_FILE = "recording.webm"
-AUDIO_FILE = "recording.wav"
+AUDIO_WEBM = "recording.webm"
+AUDIO_WAV = "recording.wav"
 TXT_FILE = "transcript.txt"
 
 model = WhisperModel("base", device="cpu", compute_type="int8")
 active_sessions = {}
 
-# ---------- JavaScript для записи экрана (видео+аудио) ----------
+# ---------- JavaScript для записи через Web Audio ----------
 JS_START_RECORDING = """
 async function startRecording() {
     try {
-        // Запрашиваем захват экрана с аудио
-        const stream = await navigator.mediaDevices.getDisplayMedia({
-            audio: true,
-            video: true
-        });
-        // Проверяем наличие дорожек
-        if (stream.getAudioTracks().length === 0) {
-            throw new Error('Нет аудио-дорожки');
+        // 1. Создаём аудио-контекст
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        // 2. Создаём destination для получения потока
+        const dest = audioCtx.createMediaStreamDestination();
+        // 3. Находим все медиа-элементы
+        const mediaElements = document.querySelectorAll('video, audio');
+        let connected = 0;
+        for (let el of mediaElements) {
+            try {
+                const source = audioCtx.createMediaElementSource(el);
+                source.connect(dest);
+                connected++;
+            } catch (e) {
+                // Элемент не поддерживает createMediaElementSource (например, уже используется)
+            }
         }
-        if (stream.getVideoTracks().length === 0) {
-            throw new Error('Нет видео-дорожки');
+        // 4. Если есть глобальный AudioContext (Web Audio), пытаемся подключиться к нему
+        if (window._audioContext) {
+            try {
+                // Создаём gain-узел для тихого микширования
+                const gain = audioCtx.createGain();
+                gain.gain.value = 1;
+                // Подключаем существующий контекст к нашему (это сложно, но мы можем просто использовать его поток)
+                // Вместо этого, если есть существующий MediaStream из веб-конференции, можно подключить его напрямую
+                // Но проще считать, что звук идёт через медиа-элементы
+            } catch (e) {}
         }
-        // Создаём MediaRecorder для WebM с видео и аудио
-        const options = { mimeType: 'video/webm;codecs=vp9,opus' };
+        if (connected === 0) {
+            // Если не удалось подключить ни одного элемента, пробуем захватить системный звук через getUserMedia
+            // Но это может попросить микрофон, что не то же самое
+            // Вместо этого создаём фиктивный источник тишины, чтобы не было ошибки
+            // Но лучше выдать ошибку
+            throw new Error('Не найдено аудио-элементов для захвата');
+        }
+        // 5. Получаем поток из destination
+        const stream = dest.stream;
+        // 6. Запускаем MediaRecorder
+        const options = { mimeType: 'audio/webm;codecs=opus' };
         let recorder;
         try {
             recorder = new MediaRecorder(stream, options);
         } catch (e) {
-            // fallback на стандартный кодек
-            recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+            recorder = new MediaRecorder(stream);
         }
         const chunks = [];
         recorder.ondataavailable = e => chunks.push(e.data);
         recorder.onstop = () => {
-            const blob = new Blob(chunks, { type: 'video/webm' });
+            const blob = new Blob(chunks, { type: 'audio/webm' });
             window._recordingBlob = blob;
             window._recordingComplete = true;
         };
@@ -54,7 +77,9 @@ async function startRecording() {
         window._recorder = recorder;
         window._chunks = chunks;
         window._recordingComplete = false;
-        return { success: true, message: 'Запись видео+аудио начата' };
+        // Сохраняем контекст для остановки
+        window._audioCtx = audioCtx;
+        return { success: true, message: 'Запись аудио через Web Audio запущена, подключено: ' + connected };
     } catch (err) {
         return { success: false, message: err.message };
     }
@@ -85,32 +110,34 @@ function stopRecordingAndGetData() {
         if (window._recorder.stream) {
             window._recorder.stream.getTracks().forEach(track => track.stop());
         }
+        // Закрываем аудио-контекст
+        if (window._audioCtx) {
+            window._audioCtx.close();
+        }
     });
 }
 """
 
-# ---------- Вспомогательная функция для извлечения аудио из видео ----------
-def extract_audio_from_video(video_path, audio_path):
-    """Извлекает аудио из WebM в WAV (16 кГц, моно)"""
+# ---------- Вспомогательная функция ----------
+def convert_webm_to_wav(webm_path, wav_path):
     cmd = [
-        "ffmpeg", "-i", video_path,
-        "-vn",                     # без видео
+        "ffmpeg", "-i", webm_path,
         "-acodec", "pcm_s16le",
         "-ar", "16000",
         "-ac", "1",
-        "-y", audio_path
+        "-y", wav_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg extraction error: {result.stderr}")
-    return audio_path
+        raise RuntimeError(f"ffmpeg conversion error: {result.stderr}")
+    return wav_path
 
 # ---------- Команды бота ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Отправь ссылку на конференцию Яндекс.Телемост.\n"
         "Когда встреча закончится — отправь /stop.\n"
-        "Я запишу видео с экрана, извлеку аудио и пришлю расшифровку."
+        "Я запишу аудио через Web Audio API и пришлю расшифровку."
     )
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -140,11 +167,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "--autoplay-policy=no-user-gesture-required",
                 "--use-fake-ui-for-media-stream",
                 "--enable-audio",
-                "--auto-select-desktop-capture-source=0",  # автоматически выбрать экран
+                "--use-fake-device-for-media-stream",  # помогает с audio-устройствами
             ]
         )
         context = await browser.new_context(
-            permissions=["microphone", "camera"],  # display-capture не требуется
+            permissions=["microphone", "camera"],
             viewport={"width": 1280, "height": 720}
         )
         page = await context.new_page()
@@ -165,13 +192,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Включаем звук на странице (на случай, если muted)
+        # Включаем звук на странице
         await page.evaluate("""
             document.querySelectorAll('video, audio').forEach(el => el.muted = false);
             document.querySelectorAll('[aria-label*="sound" i], [aria-label*="mute" i]').forEach(el => el.click());
         """)
 
-        await update.message.reply_text("🎙️ Запускаю запись видео+аудио через браузер...")
+        await update.message.reply_text("🎙️ Запускаю запись аудио через Web Audio...")
         result = await page.evaluate(JS_START_RECORDING)
         if not result.get("success"):
             await update.message.reply_text(f"❌ Не удалось начать запись: {result.get('message')}")
@@ -179,7 +206,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await p.stop()
             return
 
-        await update.message.reply_text("✅ Запись видео+аудио запущена.")
+        await update.message.reply_text("✅ Запись аудио запущена.")
 
         active_sessions[chat_id] = {
             'playwright': p,
@@ -232,20 +259,18 @@ async def stop_session(chat_id, update=None, notify=True):
         if not result.get("success"):
             errors.append(f"Ошибка остановки записи: {result.get('message')}")
         else:
-            video_base64 = result.get("data")
-            if video_base64:
-                # Сохраняем видеофайл
-                with open(VIDEO_FILE, "wb") as f:
-                    f.write(base64.b64decode(video_base64))
-                log_msgs.append(f"✅ Видео получено, размер: {result.get('size')} байт")
+            audio_base64 = result.get("data")
+            if audio_base64:
+                with open(AUDIO_WEBM, "wb") as f:
+                    f.write(base64.b64decode(audio_base64))
+                log_msgs.append(f"✅ Аудио получено, размер: {result.get('size')} байт")
                 if update:
-                    await update.message.reply_text("🔄 Извлекаю аудио из видео...")
-                # Извлекаем аудио в WAV
-                extract_audio_from_video(VIDEO_FILE, AUDIO_FILE)
-                os.remove(VIDEO_FILE)
-                log_msgs.append("✅ Аудио извлечено")
+                    await update.message.reply_text("🔄 Конвертирую аудио в WAV...")
+                convert_webm_to_wav(AUDIO_WEBM, AUDIO_WAV)
+                os.remove(AUDIO_WEBM)
+                log_msgs.append("✅ Конвертация завершена")
             else:
-                errors.append("Видео-данные не получены")
+                errors.append("Аудио-данные не получены")
     except Exception as e:
         errors.append(f"Ошибка при остановке записи: {e}")
 
@@ -274,13 +299,13 @@ async def stop_session(chat_id, update=None, notify=True):
     del active_sessions[chat_id]
 
     # Проверка аудиофайла
-    if not os.path.exists(AUDIO_FILE) or os.path.getsize(AUDIO_FILE) == 0:
+    if not os.path.exists(AUDIO_WAV) or os.path.getsize(AUDIO_WAV) == 0:
         errors.append("Аудиофайл не создан или пуст.")
         if update and notify:
             await update.message.reply_text("⚠️ Аудиофайл не создан. Запись не удалась.")
         return False, None, errors
 
-    size = os.path.getsize(AUDIO_FILE)
+    size = os.path.getsize(AUDIO_WAV)
     log_msgs.append(f"📁 Размер аудио: {size} байт")
 
     # Транскрипция
@@ -288,10 +313,10 @@ async def stop_session(chat_id, update=None, notify=True):
         if update and notify:
             await update.message.reply_text("🧠 Начинаю транскрипцию...")
 
-        if os.path.getsize(AUDIO_FILE) < 1000:
+        if os.path.getsize(AUDIO_WAV) < 1000:
             await update.message.reply_text("⚠️ Аудиофайл очень маленький (вероятно, тишина). Проверьте звук в конференции.")
 
-        segments, info = model.transcribe(AUDIO_FILE, beam_size=5)
+        segments, info = model.transcribe(AUDIO_WAV, beam_size=5)
         transcription = " ".join([seg.text for seg in segments])
         log_msgs.append("✅ Транскрипция завершена.")
 
@@ -301,7 +326,7 @@ async def stop_session(chat_id, update=None, notify=True):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         audio_saved = f"recording_{timestamp}.wav"
         txt_saved = f"transcript_{timestamp}.txt"
-        shutil.copy(AUDIO_FILE, audio_saved)
+        shutil.copy(AUDIO_WAV, audio_saved)
         shutil.copy(TXT_FILE, txt_saved)
 
         if update and notify:
@@ -310,8 +335,8 @@ async def stop_session(chat_id, update=None, notify=True):
             if errors:
                 await update.message.reply_text(f"⚠️ Ошибки:\n{chr(10).join(errors)}")
 
-            if os.path.exists(AUDIO_FILE) and os.path.getsize(AUDIO_FILE) > 0:
-                with open(AUDIO_FILE, "rb") as f:
+            if os.path.exists(AUDIO_WAV) and os.path.getsize(AUDIO_WAV) > 0:
+                with open(AUDIO_WAV, "rb") as f:
                     await update.message.reply_audio(
                         audio=f,
                         filename="recording.wav",
@@ -329,7 +354,7 @@ async def stop_session(chat_id, update=None, notify=True):
             if not transcription.strip():
                 await update.message.reply_text("⚠️ Внимание: расшифровка пуста. Возможно, в записи нет речи или аудио слишком тихое.")
 
-            os.remove(AUDIO_FILE)
+            os.remove(AUDIO_WAV)
             os.remove(TXT_FILE)
 
         return True, transcription, errors
