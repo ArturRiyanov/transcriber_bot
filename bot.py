@@ -1,10 +1,10 @@
 import os
 import asyncio
-import subprocess
 import time
+import psutil
 from datetime import datetime
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from faster_whisper import WhisperModel
 from playwright.async_api import async_playwright
 
@@ -67,14 +67,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # ===== ЗАПУСК ffmpeg с логированием ошибок =====
+        # ===== ЗАПУСК ffmpeg через shell =====
         await update.message.reply_text("🎙️ Запускаю ffmpeg...")
-        # Используем shell-команду, чтобы видеть ошибки, и перенаправляем stderr в отдельный файл
         ffmpeg_cmd = (
             f"ffmpeg -f pulse -i virtual_sink.monitor "
             f"-acodec pcm_s16le -ar 16000 -ac 1 -y {AUDIO_FILE} 2> ffmpeg_error.log"
         )
-        # Запускаем в shell, чтобы легко работать с перенаправлением
         ffmpeg_process = await asyncio.create_subprocess_shell(
             ffmpeg_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -82,12 +80,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cwd=os.getcwd()
         )
 
-        # Проверяем, создался ли файл записи через пару секунд
+        # Даём время на создание файла
         await asyncio.sleep(2)
         if os.path.exists(AUDIO_FILE):
             await update.message.reply_text("✅ ffmpeg запущен, файл записи создан.")
         else:
-            # Если файла нет, читаем ошибку
             error_log = ""
             if os.path.exists("ffmpeg_error.log"):
                 with open("ffmpeg_error.log", "r") as f:
@@ -126,7 +123,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 async def stop_session(chat_id, update=None, notify=True):
-    """Останавливаем ffmpeg, закрываем браузер, транскрибируем и отправляем результат."""
+    """Останавливаем ffmpeg (через psutil), закрываем браузер, транскрибируем."""
     if chat_id not in active_sessions:
         if update and notify:
             await update.message.reply_text("❌ Нет активной сессии для остановки.")
@@ -139,26 +136,42 @@ async def stop_session(chat_id, update=None, notify=True):
     errors = []
     log_msgs = []
 
-    # 1. Останавливаем ffmpeg
+    # ===== 1. Останавливаем ffmpeg с помощью psutil =====
     try:
-        ffmpeg = session.get('ffmpeg')
-        if ffmpeg:
+        ffmpeg_proc = session.get('ffmpeg')
+        if ffmpeg_proc:
             if update:
                 await update.message.reply_text("⏹️ Останавливаю ffmpeg...")
-            ffmpeg.terminate()
-            try:
-                stdout, stderr = await asyncio.wait_for(ffmpeg.communicate(), timeout=10.0)
-                if stderr:
-                    errors.append(f"ffmpeg stderr: {stderr.decode()[:200]}")
-                log_msgs.append("ffmpeg завершён.")
-            except asyncio.TimeoutError:
-                ffmpeg.kill()
-                stdout, stderr = await ffmpeg.communicate()
-                errors.append("ffmpeg убит по таймауту")
+            
+            # Получаем родительский процесс (оболочка)
+            parent = psutil.Process(ffmpeg_proc.pid)
+            # Получаем всех детей (включая сам ffmpeg)
+            children = parent.children(recursive=True)
+            # Добавляем и родителя, и детей в список для завершения
+            procs_to_kill = [parent] + children
+            
+            # Сначала terminate всем
+            for p in procs_to_kill:
+                try:
+                    p.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            
+            # Ждём до 5 секунд
+            gone, alive = psutil.wait_procs(procs_to_kill, timeout=5)
+            
+            # Если остались живые — убиваем их
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            
+            log_msgs.append("✅ ffmpeg остановлен.")
     except Exception as e:
-        errors.append(f"ffmpeg error: {e}")
+        errors.append(f"ffmpeg stop error: {e}")
 
-    # 2. Закрываем браузер и Playwright
+    # ===== 2. Закрываем браузер и Playwright =====
     try:
         await session['page'].close()
     except Exception as e:
@@ -182,7 +195,7 @@ async def stop_session(chat_id, update=None, notify=True):
 
     del active_sessions[chat_id]
 
-    # 3. Проверяем файл записи
+    # ===== 3. Проверяем файл записи =====
     if os.path.exists(AUDIO_FILE) and os.path.getsize(AUDIO_FILE) > 0:
         size = os.path.getsize(AUDIO_FILE)
         log_msgs.append(f"📁 Размер файла: {size} байт")
@@ -190,14 +203,13 @@ async def stop_session(chat_id, update=None, notify=True):
         errors.append("Файл записи не найден или пуст.")
         if update and notify:
             await update.message.reply_text("⚠️ Аудиофайл не найден. Запись не удалась.")
-            # Проверим, есть ли лог ошибок ffmpeg
             if os.path.exists("ffmpeg_error.log"):
                 with open("ffmpeg_error.log", "r") as f:
                     error_text = f.read()
                 await update.message.reply_text(f"📄 Лог ошибок ffmpeg:\n{error_text[:500]}")
         return False, None, errors
 
-    # 4. Транскрипция
+    # ===== 4. Транскрипция =====
     try:
         if update and notify:
             await update.message.reply_text("🧠 Начинаю транскрипцию...")
@@ -210,10 +222,12 @@ async def stop_session(chat_id, update=None, notify=True):
             f.write(transcription)
 
         if update and notify:
+            # Отправляем логи
             for msg in log_msgs:
                 await update.message.reply_text(msg)
             if errors:
                 await update.message.reply_text(f"⚠️ Ошибки:\n{chr(10).join(errors)}")
+            # Отправляем расшифровку
             if len(transcription) > 4000:
                 await update.message.reply_document(
                     document=open(txt_file, "rb"),
@@ -221,6 +235,7 @@ async def stop_session(chat_id, update=None, notify=True):
                 )
             else:
                 await update.message.reply_text(f"📝 Расшифровка:\n\n{transcription}")
+            # Чистим файлы
             os.remove(AUDIO_FILE)
             os.remove(txt_file)
         return True, transcription, errors
@@ -241,6 +256,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Критическая ошибка: {e}")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Обработка загруженных аудио (оставляем для совместимости)
     await update.message.reply_text("🎧 Секунду...")
     file = await update.message.effective_attachment.get_file()
     path = "temp_audio." + file.file_path.split(".")[-1]
@@ -253,6 +269,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO, handle_audio))
-app.add_handler(MessageHandler(filters.COMMAND & filters.Text(["start"]), start))
-app.add_handler(MessageHandler(filters.COMMAND & filters.Text(["stop"]), stop))
-app.run_polling()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("stop", stop))
+
+app.run_polling(close_loop=False)
