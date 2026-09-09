@@ -8,11 +8,11 @@ TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
 
 model = WhisperModel("base", device="cpu", compute_type="int8")
 
-# Хранилище активных браузеров: {chat_id: {'browser': ..., 'context': ..., 'page': ...}}
+# Хранилище активных сессий: {chat_id: {'playwright': obj, 'browser': obj, 'context': obj, 'page': obj}}
 active_sessions = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Отправь ссылку на конференцию Яндекс.Телемост (или голосовое для транскрибации). Когда закончишь — отправь /stop.")
+    await update.message.reply_text("Привет! Отправь ссылку на конференцию Яндекс.Телемост. Когда закончишь — отправь /stop.")
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -28,7 +28,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Подключаюсь к конференции... Это может занять 20-30 секунд.")
 
-    async with async_playwright() as p:
+    # Запускаем Playwright вручную, чтобы он не закрылся после обработчика
+    try:
+        p = await async_playwright().start()
         browser = await p.chromium.launch(headless=True, args=[
             "--disable-dev-shm-usage",
             "--disable-gpu",
@@ -42,39 +44,61 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         page = await context.new_page()
 
-        try:
-            await page.goto(url, wait_until="load", timeout=60000)
+        await page.goto(url, wait_until="load", timeout=60000)
+        await page.wait_for_timeout(5000)
+
+        # Ввод имени
+        name_input = await page.query_selector("input[placeholder*='имя'], input[placeholder*='Ваше'], input[type='text']")
+        if name_input:
+            await name_input.fill("Transcriber Bot")
+            await page.wait_for_timeout(1000)
+
+        # Клик по кнопке входа
+        join_button = await page.query_selector("button:has-text('Подключиться'), button:has-text('Войти'), button:has-text('Присоединиться')")
+        if join_button:
+            await join_button.click()
             await page.wait_for_timeout(5000)
 
-            # Логика входа
-            name_input = await page.query_selector("input[placeholder*='имя'], input[placeholder*='Ваше'], input[type='text']")
-            if name_input:
-                await name_input.fill("Transcriber Bot")
-                await page.wait_for_timeout(1000)
+        # Сохраняем сессию
+        active_sessions[chat_id] = {
+            'playwright': p,
+            'browser': browser,
+            'context': context,
+            'page': page
+        }
 
-            join_button = await page.query_selector("button:has-text('Подключиться'), button:has-text('Войти'), button:has-text('Присоединиться')")
-            if join_button:
-                await join_button.click()
-                await page.wait_for_timeout(5000)
+        # Отправляем подтверждение
+        screenshot = await page.screenshot()
+        await update.message.reply_photo(photo=screenshot, caption="Я вошёл в конференцию! Остаюсь здесь, пока ты не отправишь /stop.")
 
-            # Сохраняем сессию
-            active_sessions[chat_id] = {'browser': browser, 'context': context, 'page': page}
-
-            # Отправляем подтверждение
-            screenshot = await page.screenshot()
-            await update.message.reply_photo(photo=screenshot, caption="Я вошёл в конференцию! Остаюсь здесь, пока ты не отправишь /stop.")
-
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка подключения: {e}")
-            await browser.close()
-            if chat_id in active_sessions:
-                del active_sessions[chat_id]
+    except Exception as e:
+        # Если что-то пошло не так, закрываем всё
+        await update.message.reply_text(f"Ошибка подключения: {e}")
+        if chat_id in active_sessions:
+            await stop_session(chat_id)
+        else:
+            # Закрываем браузер вручную
+            try:
+                await browser.close()
+            except:
+                pass
+            try:
+                await p.stop()
+            except:
+                pass
 
 async def stop_session(chat_id):
-    """Закрываем браузер для конкретного чата"""
+    """Закрываем браузер и Playwright для конкретного чата"""
     if chat_id in active_sessions:
         session = active_sessions[chat_id]
-        await session['browser'].close()
+        try:
+            await session['browser'].close()
+        except:
+            pass
+        try:
+            await session['playwright'].stop()
+        except:
+            pass
         del active_sessions[chat_id]
         return True
     return False
