@@ -2,6 +2,7 @@ import os
 import asyncio
 import time
 import psutil
+import shutil
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -10,6 +11,7 @@ from playwright.async_api import async_playwright
 
 TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
 AUDIO_FILE = "recording.wav"
+TXT_FILE = "transcript.txt"
 
 model = WhisperModel("base", device="cpu", compute_type="int8")
 active_sessions = {}
@@ -18,7 +20,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Отправь ссылку на конференцию Яндекс.Телемост.\n"
         "Когда встреча закончится — отправь /stop.\n"
-        "Я буду присылать статусы каждого шага."
+        "Я пришлю аудиозапись и расшифровку."
     )
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -67,10 +69,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # ===== ЗАПУСК ffmpeg через shell =====
+        # Запуск ffmpeg (используем default – системный звук)
         await update.message.reply_text("🎙️ Запускаю ffmpeg...")
         ffmpeg_cmd = (
-            f"ffmpeg -f pulse -i virtual_sink.monitor "
+            f"ffmpeg -f pulse -i default "
             f"-acodec pcm_s16le -ar 16000 -ac 1 -y {AUDIO_FILE} 2> ffmpeg_error.log"
         )
         ffmpeg_process = await asyncio.create_subprocess_shell(
@@ -80,7 +82,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cwd=os.getcwd()
         )
 
-        # Даём время на создание файла
         await asyncio.sleep(2)
         if os.path.exists(AUDIO_FILE):
             await update.message.reply_text("✅ ffmpeg запущен, файл записи создан.")
@@ -123,7 +124,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 async def stop_session(chat_id, update=None, notify=True):
-    """Останавливаем ffmpeg (через psutil), закрываем браузер, транскрибируем."""
     if chat_id not in active_sessions:
         if update and notify:
             await update.message.reply_text("❌ Нет активной сессии для остановки.")
@@ -136,42 +136,31 @@ async def stop_session(chat_id, update=None, notify=True):
     errors = []
     log_msgs = []
 
-    # ===== 1. Останавливаем ffmpeg с помощью psutil =====
+    # Остановка ffmpeg через psutil
     try:
         ffmpeg_proc = session.get('ffmpeg')
         if ffmpeg_proc:
             if update:
                 await update.message.reply_text("⏹️ Останавливаю ffmpeg...")
-            
-            # Получаем родительский процесс (оболочка)
             parent = psutil.Process(ffmpeg_proc.pid)
-            # Получаем всех детей (включая сам ffmpeg)
             children = parent.children(recursive=True)
-            # Добавляем и родителя, и детей в список для завершения
             procs_to_kill = [parent] + children
-            
-            # Сначала terminate всем
             for p in procs_to_kill:
                 try:
                     p.terminate()
                 except psutil.NoSuchProcess:
                     pass
-            
-            # Ждём до 5 секунд
             gone, alive = psutil.wait_procs(procs_to_kill, timeout=5)
-            
-            # Если остались живые — убиваем их
             for p in alive:
                 try:
                     p.kill()
                 except psutil.NoSuchProcess:
                     pass
-            
             log_msgs.append("✅ ffmpeg остановлен.")
     except Exception as e:
         errors.append(f"ffmpeg stop error: {e}")
 
-    # ===== 2. Закрываем браузер и Playwright =====
+    # Закрытие браузера
     try:
         await session['page'].close()
     except Exception as e:
@@ -195,11 +184,8 @@ async def stop_session(chat_id, update=None, notify=True):
 
     del active_sessions[chat_id]
 
-    # ===== 3. Проверяем файл записи =====
-    if os.path.exists(AUDIO_FILE) and os.path.getsize(AUDIO_FILE) > 0:
-        size = os.path.getsize(AUDIO_FILE)
-        log_msgs.append(f"📁 Размер файла: {size} байт")
-    else:
+    # Проверка файла
+    if not os.path.exists(AUDIO_FILE) or os.path.getsize(AUDIO_FILE) == 0:
         errors.append("Файл записи не найден или пуст.")
         if update and notify:
             await update.message.reply_text("⚠️ Аудиофайл не найден. Запись не удалась.")
@@ -209,7 +195,10 @@ async def stop_session(chat_id, update=None, notify=True):
                 await update.message.reply_text(f"📄 Лог ошибок ffmpeg:\n{error_text[:500]}")
         return False, None, errors
 
-    # ===== 4. Транскрипция =====
+    size = os.path.getsize(AUDIO_FILE)
+    log_msgs.append(f"📁 Размер файла: {size} байт")
+
+    # Транскрипция
     try:
         if update and notify:
             await update.message.reply_text("🧠 Начинаю транскрипцию...")
@@ -217,9 +206,16 @@ async def stop_session(chat_id, update=None, notify=True):
         transcription = " ".join([seg.text for seg in segments])
         log_msgs.append("✅ Транскрипция завершена.")
 
-        txt_file = "transcript.txt"
-        with open(txt_file, "w", encoding="utf-8") as f:
+        # Сохраняем текст в файл
+        with open(TXT_FILE, "w", encoding="utf-8") as f:
             f.write(transcription)
+
+        # Сохраняем копии с датой на сервере
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        audio_saved = f"recording_{timestamp}.wav"
+        txt_saved = f"transcript_{timestamp}.txt"
+        shutil.copy(AUDIO_FILE, audio_saved)
+        shutil.copy(TXT_FILE, txt_saved)
 
         if update and notify:
             # Отправляем логи
@@ -227,17 +223,33 @@ async def stop_session(chat_id, update=None, notify=True):
                 await update.message.reply_text(msg)
             if errors:
                 await update.message.reply_text(f"⚠️ Ошибки:\n{chr(10).join(errors)}")
-            # Отправляем расшифровку
-            if len(transcription) > 4000:
-                await update.message.reply_document(
-                    document=open(txt_file, "rb"),
-                    caption="📝 Расшифровка (файл)"
-                )
-            else:
-                await update.message.reply_text(f"📝 Расшифровка:\n\n{transcription}")
-            # Чистим файлы
+
+            # Отправляем аудиофайл
+            if os.path.exists(AUDIO_FILE):
+                with open(AUDIO_FILE, "rb") as f:
+                    await update.message.reply_audio(
+                        audio=f,
+                        filename="recording.wav",
+                        caption="🎧 Аудиозапись встречи"
+                    )
+
+            # Отправляем текстовый файл (всегда)
+            if os.path.exists(TXT_FILE):
+                with open(TXT_FILE, "rb") as f:
+                    await update.message.reply_document(
+                        document=f,
+                        filename="transcript.txt",
+                        caption="📝 Расшифровка встречи"
+                    )
+
+            # Если транскрипция пустая – предупреждаем
+            if not transcription.strip():
+                await update.message.reply_text("⚠️ Внимание: расшифровка пуста. Возможно, в записи нет речи или аудио слишком тихое.")
+
+            # Удаляем временные файлы (копии с датой остаются на сервере)
             os.remove(AUDIO_FILE)
-            os.remove(txt_file)
+            os.remove(TXT_FILE)
+
         return True, transcription, errors
     except Exception as e:
         errors.append(f"transcription: {e}")
@@ -256,7 +268,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Критическая ошибка: {e}")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Обработка загруженных аудио (оставляем для совместимости)
+    # Обработка загруженных аудио (для совместимости)
     await update.message.reply_text("🎧 Секунду...")
     file = await update.message.effective_attachment.get_file()
     path = "temp_audio." + file.file_path.split(".")[-1]
