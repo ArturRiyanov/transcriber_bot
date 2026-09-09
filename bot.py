@@ -18,15 +18,12 @@ TXT_FILE = "transcript.txt"
 model = WhisperModel("base", device="cpu", compute_type="int8")
 active_sessions = {}
 
-# ---------- JavaScript для записи через Web Audio ----------
+# ---------- JavaScript для записи через Web Audio (исправленный) ----------
 JS_START_RECORDING = """
 async function startRecording() {
     try {
-        // 1. Создаём аудио-контекст
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        // 2. Создаём destination для получения потока
         const dest = audioCtx.createMediaStreamDestination();
-        // 3. Находим все медиа-элементы
         const mediaElements = document.querySelectorAll('video, audio');
         let connected = 0;
         for (let el of mediaElements) {
@@ -34,31 +31,12 @@ async function startRecording() {
                 const source = audioCtx.createMediaElementSource(el);
                 source.connect(dest);
                 connected++;
-            } catch (e) {
-                // Элемент не поддерживает createMediaElementSource (например, уже используется)
-            }
-        }
-        // 4. Если есть глобальный AudioContext (Web Audio), пытаемся подключиться к нему
-        if (window._audioContext) {
-            try {
-                // Создаём gain-узел для тихого микширования
-                const gain = audioCtx.createGain();
-                gain.gain.value = 1;
-                // Подключаем существующий контекст к нашему (это сложно, но мы можем просто использовать его поток)
-                // Вместо этого, если есть существующий MediaStream из веб-конференции, можно подключить его напрямую
-                // Но проще считать, что звук идёт через медиа-элементы
             } catch (e) {}
         }
         if (connected === 0) {
-            // Если не удалось подключить ни одного элемента, пробуем захватить системный звук через getUserMedia
-            // Но это может попросить микрофон, что не то же самое
-            // Вместо этого создаём фиктивный источник тишины, чтобы не было ошибки
-            // Но лучше выдать ошибку
             throw new Error('Не найдено аудио-элементов для захвата');
         }
-        // 5. Получаем поток из destination
         const stream = dest.stream;
-        // 6. Запускаем MediaRecorder
         const options = { mimeType: 'audio/webm;codecs=opus' };
         let recorder;
         try {
@@ -67,19 +45,19 @@ async function startRecording() {
             recorder = new MediaRecorder(stream);
         }
         const chunks = [];
-        recorder.ondataavailable = e => chunks.push(e.data);
+        recorder.ondataavailable = e => {
+            if (e.data.size > 0) chunks.push(e.data);
+        };
         recorder.onstop = () => {
-            const blob = new Blob(chunks, { type: 'audio/webm' });
-            window._recordingBlob = blob;
+            window._chunks = chunks;
             window._recordingComplete = true;
         };
-        recorder.start();
+        // Запускаем с интервалом 1 секунда для сбора чанков
+        recorder.start(1000);
         window._recorder = recorder;
-        window._chunks = chunks;
-        window._recordingComplete = false;
-        // Сохраняем контекст для остановки
         window._audioCtx = audioCtx;
-        return { success: true, message: 'Запись аудио через Web Audio запущена, подключено: ' + connected };
+        window._recordingComplete = false;
+        return { success: true, message: 'Запись аудио запущена, подключено: ' + connected };
     } catch (err) {
         return { success: false, message: err.message };
     }
@@ -93,27 +71,31 @@ function stopRecordingAndGetData() {
             resolve({ success: false, message: 'Рекордер не найден' });
             return;
         }
-        window._recorder.onstop = () => {
-            const blob = window._recordingBlob;
-            if (!blob) {
-                resolve({ success: false, message: 'Blob не создан' });
+        const recorder = window._recorder;
+        // Останавливаем рекордер (это вызовет onstop, который сохранит чанки)
+        recorder.stop();
+        // Останавливаем треки
+        if (recorder.stream) {
+            recorder.stream.getTracks().forEach(track => track.stop());
+        }
+        if (window._audioCtx) {
+            window._audioCtx.close();
+        }
+        // Ждём немного, чтобы onstop успел обработать данные
+        setTimeout(() => {
+            const chunks = window._chunks || [];
+            if (chunks.length === 0) {
+                resolve({ success: false, message: 'Нет данных для создания blob' });
                 return;
             }
+            const blob = new Blob(chunks, { type: 'audio/webm' });
             const reader = new FileReader();
             reader.onloadend = () => {
                 const base64data = reader.result.split(',')[1];
                 resolve({ success: true, data: base64data, size: blob.size });
             };
             reader.readAsDataURL(blob);
-        };
-        window._recorder.stop();
-        if (window._recorder.stream) {
-            window._recorder.stream.getTracks().forEach(track => track.stop());
-        }
-        // Закрываем аудио-контекст
-        if (window._audioCtx) {
-            window._audioCtx.close();
-        }
+        }, 1500); // даём время на завершение
     });
 }
 """
@@ -132,7 +114,7 @@ def convert_webm_to_wav(webm_path, wav_path):
         raise RuntimeError(f"ffmpeg conversion error: {result.stderr}")
     return wav_path
 
-# ---------- Команды бота ----------
+# ---------- Команды бота (без изменений) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Отправь ссылку на конференцию Яндекс.Телемост.\n"
@@ -167,7 +149,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "--autoplay-policy=no-user-gesture-required",
                 "--use-fake-ui-for-media-stream",
                 "--enable-audio",
-                "--use-fake-device-for-media-stream",  # помогает с audio-устройствами
+                "--use-fake-device-for-media-stream",
             ]
         )
         context = await browser.new_context(
@@ -192,7 +174,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Включаем звук на странице
         await page.evaluate("""
             document.querySelectorAll('video, audio').forEach(el => el.muted = false);
             document.querySelectorAll('[aria-label*="sound" i], [aria-label*="mute" i]').forEach(el => el.click());
