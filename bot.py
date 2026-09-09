@@ -43,75 +43,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await page.goto(url, wait_until="load", timeout=60000)
         await page.wait_for_timeout(5000)
 
-        # Ввод имени
+        # ===== Ввод понятного имени =====
         name_input = await page.query_selector("input[placeholder*='имя'], input[placeholder*='Ваше'], input[type='text']")
         if name_input:
-            await name_input.fill("Transcriber Bot")
+            await name_input.fill("🤖 Запись встречи (Transcriber)")
             await page.wait_for_timeout(1000)
 
+        # Клик по кнопке входа
         join_button = await page.query_selector("button:has-text('Подключиться'), button:has-text('Войти'), button:has-text('Присоединиться')")
         if join_button:
             await join_button.click()
             await page.wait_for_timeout(5000)
-
-        # ========== ОТПРАВКА СООБЩЕНИЯ В ЧАТ (улучшенная) ==========
-        try:
-            # Ждём, пока появится чат (любой элемент с редактируемым полем)
-            await page.wait_for_selector(
-                "textarea, input[type='text'], div[contenteditable='true'], [role='textbox']",
-                timeout=15000
-            )
-            # Ищем поле ввода с помощью JavaScript (более надёжно)
-            message_text = "🤖 Этот бот записывает аудио для создания транскрипции встречи. Пожалуйста, подтвердите своё согласие на запись. Если вы против, просто скажите – я завершу сессию."
-            sent = await page.evaluate(f"""
-                async () => {{
-                    // Поиск поля ввода
-                    let input = document.querySelector('textarea') ||
-                                document.querySelector('input[type="text"]') ||
-                                document.querySelector('[contenteditable="true"]') ||
-                                document.querySelector('[role="textbox"]');
-                    if (!input) return false;
-
-                    // Устанавливаем текст
-                    if (input.tagName === 'DIV' && input.contentEditable === 'true') {{
-                        input.innerText = `{message_text}`;
-                    }} else {{
-                        input.value = `{message_text}`;
-                    }}
-
-                    // Ищем кнопку отправки
-                    let sendBtn = document.querySelector('button[aria-label*="отправить"]') ||
-                                  document.querySelector('button[aria-label*="Send"]') ||
-                                  document.querySelector('button[type="submit"]') ||
-                                  document.querySelector('button:has-text("Отправить")') ||
-                                  document.querySelector('button:has-text("Send")');
-                    if (sendBtn) {{
-                        sendBtn.click();
-                        return true;
-                    }} else {{
-                        // Если кнопки нет, имитируем нажатие Enter
-                        const enterEvent = new KeyboardEvent('keydown', {{key: 'Enter', code: 'Enter', which: 13}});
-                        input.dispatchEvent(enterEvent);
-                        return true;
-                    }}
-                }}
-            """)
-            if sent:
-                await page.wait_for_timeout(2000)
-            else:
-                # Если JS не сработал, пробуем старый метод с селекторами
-                chat_input = await page.query_selector("textarea, input[type='text'], div[contenteditable='true']")
-                if chat_input:
-                    await chat_input.fill(message_text)
-                    await page.wait_for_timeout(1000)
-                    send_button = await page.query_selector("button[aria-label*='отправить'], button[type='submit']")
-                    if send_button:
-                        await send_button.click()
-                    else:
-                        await chat_input.press("Enter")
-        except Exception as e:
-            # Если не удалось, просто логируем (в Telegram не отправляем, чтобы не сбивать пользователя)
-            print(f"Не удалось отправить сообщение: {e}")
 
         # Сохраняем сессию
         active_sessions[chat_id] = {
@@ -122,7 +64,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         screenshot = await page.screenshot()
-        await update.message.reply_photo(photo=screenshot, caption="Я вошёл в конференцию и попытался отправить сообщение о записи. Остаюсь здесь, пока ты не отправишь /stop.")
+        await update.message.reply_photo(
+            photo=screenshot,
+            caption="✅ Я вошёл в конференцию под именем «🤖 Запись встречи (Transcriber)». Участники видят меня в списке. Остаюсь здесь до команды /stop."
+        )
 
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка подключения: {e}")
