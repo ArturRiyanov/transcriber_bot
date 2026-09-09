@@ -3,6 +3,7 @@ import asyncio
 import psutil
 import shutil
 import subprocess
+import base64
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -10,20 +11,106 @@ from faster_whisper import WhisperModel
 from playwright.async_api import async_playwright
 
 TOKEN = "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE"
+VIDEO_FILE = "recording.webm"
 AUDIO_FILE = "recording.wav"
 TXT_FILE = "transcript.txt"
 
 model = WhisperModel("base", device="cpu", compute_type="int8")
 active_sessions = {}
 
-# Имя существующего sink (из pactl info)
-SINK_NAME = "virtual_sink"
+# ---------- JavaScript для записи экрана (видео+аудио) ----------
+JS_START_RECORDING = """
+async function startRecording() {
+    try {
+        // Запрашиваем захват экрана с аудио
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+            audio: true,
+            video: true
+        });
+        // Проверяем наличие дорожек
+        if (stream.getAudioTracks().length === 0) {
+            throw new Error('Нет аудио-дорожки');
+        }
+        if (stream.getVideoTracks().length === 0) {
+            throw new Error('Нет видео-дорожки');
+        }
+        // Создаём MediaRecorder для WebM с видео и аудио
+        const options = { mimeType: 'video/webm;codecs=vp9,opus' };
+        let recorder;
+        try {
+            recorder = new MediaRecorder(stream, options);
+        } catch (e) {
+            // fallback на стандартный кодек
+            recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+        }
+        const chunks = [];
+        recorder.ondataavailable = e => chunks.push(e.data);
+        recorder.onstop = () => {
+            const blob = new Blob(chunks, { type: 'video/webm' });
+            window._recordingBlob = blob;
+            window._recordingComplete = true;
+        };
+        recorder.start();
+        window._recorder = recorder;
+        window._chunks = chunks;
+        window._recordingComplete = false;
+        return { success: true, message: 'Запись видео+аудио начата' };
+    } catch (err) {
+        return { success: false, message: err.message };
+    }
+}
+"""
 
+JS_STOP_RECORDING = """
+function stopRecordingAndGetData() {
+    return new Promise((resolve) => {
+        if (!window._recorder) {
+            resolve({ success: false, message: 'Рекордер не найден' });
+            return;
+        }
+        window._recorder.onstop = () => {
+            const blob = window._recordingBlob;
+            if (!blob) {
+                resolve({ success: false, message: 'Blob не создан' });
+                return;
+            }
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const base64data = reader.result.split(',')[1];
+                resolve({ success: true, data: base64data, size: blob.size });
+            };
+            reader.readAsDataURL(blob);
+        };
+        window._recorder.stop();
+        if (window._recorder.stream) {
+            window._recorder.stream.getTracks().forEach(track => track.stop());
+        }
+    });
+}
+"""
+
+# ---------- Вспомогательная функция для извлечения аудио из видео ----------
+def extract_audio_from_video(video_path, audio_path):
+    """Извлекает аудио из WebM в WAV (16 кГц, моно)"""
+    cmd = [
+        "ffmpeg", "-i", video_path,
+        "-vn",                     # без видео
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        "-y", audio_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg extraction error: {result.stderr}")
+    return audio_path
+
+# ---------- Команды бота ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Привет! Отправь ссылку на конференцию Яндекс.Телемост.\n"
         "Когда встреча закончится — отправь /stop.\n"
-        "Я пришлю аудиозапись и расшифровку."
+        "Я запишу видео с экрана, извлеку аудио и пришлю расшифровку."
     )
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -46,7 +133,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         browser = await p.chromium.launch(
             headless=True,
-            env={"PULSE_SINK": SINK_NAME},   # направляем звук в virtual_sink
             args=[
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
@@ -54,10 +140,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "--autoplay-policy=no-user-gesture-required",
                 "--use-fake-ui-for-media-stream",
                 "--enable-audio",
+                "--auto-select-desktop-capture-source=0",  # автоматически выбрать экран
             ]
         )
         context = await browser.new_context(
-            permissions=["microphone", "camera"],
+            permissions=["microphone", "camera"],  # display-capture не требуется
             viewport={"width": 1280, "height": 720}
         )
         page = await context.new_page()
@@ -78,44 +165,30 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await join_button.click()
             await page.wait_for_timeout(5000)
 
-        # Включаем звук на странице
+        # Включаем звук на странице (на случай, если muted)
         await page.evaluate("""
             document.querySelectorAll('video, audio').forEach(el => el.muted = false);
             document.querySelectorAll('[aria-label*="sound" i], [aria-label*="mute" i]').forEach(el => el.click());
         """)
 
-        await update.message.reply_text("🎙️ Запускаю ffmpeg (захват с virtual_sink.monitor)...")
-        ffmpeg_cmd = (
-            f"ffmpeg -f pulse -i {SINK_NAME}.monitor "
-            f"-af volume=10 "
-            f"-acodec pcm_s16le -ar 16000 -ac 1 -y {AUDIO_FILE} 2> ffmpeg_error.log"
-        )
-        ffmpeg_process = await asyncio.create_subprocess_shell(
-            ffmpeg_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=os.getcwd()
-        )
+        await update.message.reply_text("🎙️ Запускаю запись видео+аудио через браузер...")
+        result = await page.evaluate(JS_START_RECORDING)
+        if not result.get("success"):
+            await update.message.reply_text(f"❌ Не удалось начать запись: {result.get('message')}")
+            await browser.close()
+            await p.stop()
+            return
 
-        await asyncio.sleep(2)
-        if os.path.exists(AUDIO_FILE) and os.path.getsize(AUDIO_FILE) > 0:
-            await update.message.reply_text("✅ ffmpeg запущен, файл записи создан.")
-        else:
-            error_log = ""
-            if os.path.exists("ffmpeg_error.log"):
-                with open("ffmpeg_error.log", "r") as f:
-                    error_log = f.read()[:500]
-            await update.message.reply_text(f"⚠️ ffmpeg не создал файл. Ошибка: {error_log if error_log else 'неизвестна'}")
+        await update.message.reply_text("✅ Запись видео+аудио запущена.")
 
         active_sessions[chat_id] = {
             'playwright': p,
             'browser': browser,
             'context': context,
             'page': page,
-            'ffmpeg': ffmpeg_process,
             'start_time': datetime.now(),
             'update': update,
-            'cmd': ffmpeg_cmd
+            'recording_started': True
         }
 
         screenshot = await page.screenshot()
@@ -151,29 +224,30 @@ async def stop_session(chat_id, update=None, notify=True):
     errors = []
     log_msgs = []
 
-    # Остановка ffmpeg
     try:
-        ffmpeg_proc = session.get('ffmpeg')
-        if ffmpeg_proc:
-            if update:
-                await update.message.reply_text("⏹️ Останавливаю ffmpeg...")
-            parent = psutil.Process(ffmpeg_proc.pid)
-            children = parent.children(recursive=True)
-            procs_to_kill = [parent] + children
-            for p in procs_to_kill:
-                try:
-                    p.terminate()
-                except psutil.NoSuchProcess:
-                    pass
-            gone, alive = psutil.wait_procs(procs_to_kill, timeout=5)
-            for p in alive:
-                try:
-                    p.kill()
-                except psutil.NoSuchProcess:
-                    pass
-            log_msgs.append("✅ ffmpeg остановлен.")
+        if update:
+            await update.message.reply_text("⏹️ Останавливаю запись...")
+        page = session['page']
+        result = await page.evaluate(JS_STOP_RECORDING)
+        if not result.get("success"):
+            errors.append(f"Ошибка остановки записи: {result.get('message')}")
+        else:
+            video_base64 = result.get("data")
+            if video_base64:
+                # Сохраняем видеофайл
+                with open(VIDEO_FILE, "wb") as f:
+                    f.write(base64.b64decode(video_base64))
+                log_msgs.append(f"✅ Видео получено, размер: {result.get('size')} байт")
+                if update:
+                    await update.message.reply_text("🔄 Извлекаю аудио из видео...")
+                # Извлекаем аудио в WAV
+                extract_audio_from_video(VIDEO_FILE, AUDIO_FILE)
+                os.remove(VIDEO_FILE)
+                log_msgs.append("✅ Аудио извлечено")
+            else:
+                errors.append("Видео-данные не получены")
     except Exception as e:
-        errors.append(f"ffmpeg stop error: {e}")
+        errors.append(f"Ошибка при остановке записи: {e}")
 
     # Закрытие браузера и Playwright
     try:
@@ -199,19 +273,15 @@ async def stop_session(chat_id, update=None, notify=True):
 
     del active_sessions[chat_id]
 
-    # Проверка файла записи
+    # Проверка аудиофайла
     if not os.path.exists(AUDIO_FILE) or os.path.getsize(AUDIO_FILE) == 0:
-        errors.append("Файл записи не найден или пуст.")
+        errors.append("Аудиофайл не создан или пуст.")
         if update and notify:
-            await update.message.reply_text("⚠️ Аудиофайл не найден или пуст. Запись не удалась.")
-            if os.path.exists("ffmpeg_error.log"):
-                with open("ffmpeg_error.log", "r") as f:
-                    error_text = f.read()
-                await update.message.reply_text(f"📄 Лог ошибок ffmpeg:\n{error_text[:500]}")
+            await update.message.reply_text("⚠️ Аудиофайл не создан. Запись не удалась.")
         return False, None, errors
 
     size = os.path.getsize(AUDIO_FILE)
-    log_msgs.append(f"📁 Размер файла: {size} байт")
+    log_msgs.append(f"📁 Размер аудио: {size} байт")
 
     # Транскрипция
     try:
