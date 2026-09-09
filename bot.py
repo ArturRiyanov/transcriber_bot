@@ -43,16 +43,39 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await page.goto(url, wait_until="load", timeout=60000)
         await page.wait_for_timeout(5000)
 
+        # Ввод имени
         name_input = await page.query_selector("input[placeholder*='имя'], input[placeholder*='Ваше'], input[type='text']")
         if name_input:
             await name_input.fill("Transcriber Bot")
             await page.wait_for_timeout(1000)
 
+        # Клик по кнопке входа
         join_button = await page.query_selector("button:has-text('Подключиться'), button:has-text('Войти'), button:has-text('Присоединиться')")
         if join_button:
             await join_button.click()
             await page.wait_for_timeout(5000)
 
+        # ========== НОВЫЙ БЛОК: ОТПРАВКА СООБЩЕНИЯ В ЧАТ ==========
+        try:
+            # Ищем поле ввода сообщения (может быть textarea или input)
+            chat_input = await page.query_selector("textarea[placeholder*='сообщение'], input[placeholder*='Сообщение'], div[contenteditable='true']")
+            if chat_input:
+                await chat_input.fill("🤖 Этот бот записывает аудио для создания транскрипции встречи. Пожалуйста, подтвердите своё согласие на запись. Если вы против, просто скажите – я завершу сессию.")
+                await page.wait_for_timeout(1000)
+                # Ищем кнопку отправки
+                send_button = await page.query_selector("button[aria-label='Отправить'], button:has-text('Отправить'), button[type='submit']")
+                if send_button:
+                    await send_button.click()
+                    await page.wait_for_timeout(2000)
+                else:
+                    # Альтернатива: нажать Enter в поле ввода
+                    await chat_input.press("Enter")
+                    await page.wait_for_timeout(2000)
+        except Exception as e:
+            # Если не удалось отправить сообщение, просто логируем, но не прерываем работу
+            print(f"Не удалось отправить сообщение в чат: {e}")
+
+        # Сохраняем сессию
         active_sessions[chat_id] = {
             'playwright': p,
             'browser': browser,
@@ -61,7 +84,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         screenshot = await page.screenshot()
-        await update.message.reply_photo(photo=screenshot, caption="Я вошёл в конференцию! Остаюсь здесь, пока ты не отправишь /stop.")
+        await update.message.reply_photo(photo=screenshot, caption="Я вошёл в конференцию и отправил сообщение о записи. Остаюсь здесь, пока ты не отправишь /stop.")
 
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка подключения: {e}")
