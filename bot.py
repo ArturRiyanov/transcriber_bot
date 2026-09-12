@@ -1,234 +1,51 @@
 import os
-import requests
-import subprocess
 import tempfile
 import shutil
-from pathlib import Path
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
-from faster_whisper import WhisperModel
+from datetime import datetime
 
-try:
-    from pyannote.audio import Pipeline
-    import torch
-    DIARIZATION_AVAILABLE = True
-except ImportError:
-    DIARIZATION_AVAILABLE = False
-    print("[WARN] pyannote.audio не установлен")
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
+from telegram.ext import (
+    ApplicationBuilder, MessageHandler, CommandHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
 
-# ---------- Конфигурация ----------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8401430343:AAGWyxI_6x6kVtjtDL36NMn4f0oILhTZMUE")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-if not DEEPSEEK_API_KEY:
-    raise ValueError("DEEPSEEK_API_KEY not set")
-
-DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-CHUNK_MINUTES = int(os.getenv("CHUNK_MINUTES", "10"))
-
-# Коэффициенты для оценки времени (в секундах на секунду аудио)
-WHISPER_SPEED_FACTOR = float(os.getenv("WHISPER_SPEED_FACTOR", "2.5"))
-DIARIZATION_FACTOR = float(os.getenv("DIARIZATION_FACTOR", "1.0"))
-
-model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type="int8")
-
-# ---------- Очистка при старте ----------
-def cleanup_temp_files():
-    patterns = ["temp_*", "*.webm", "*.wav", "*.ogg", "*.mp4", "*.mp3", "*.m4a", "chunk_*"]
-    count = 0
-    for pattern in patterns:
-        for f in Path(".").glob(pattern):
-            try:
-                if f.is_file():
-                    f.unlink()
-                    count += 1
-            except Exception:
-                pass
-    if count:
-        print(f"[Cleanup] Удалено файлов: {count}")
+from config import TELEGRAM_TOKEN, cleanup_temp_files
+from audio_utils import extract_audio_from_video, get_audio_duration, estimate_time
+from transcription import transcribe_audio, segments_to_text, diarization_pipeline
+from deepseek_client import improve_text, analyze_interview, extract_speakers_and_roles
+from conference import join_conference, stop_conference, active_sessions, check_auto_stop
+from docx_builder import create_docx
+from storage import (
+    save_entry, list_entries, get_entry,
+    get_file_path, delete_entry, get_stats, _safe_filename
+)
 
 cleanup_temp_files()
 
-# ---------- Диаризация ----------
-diarization_pipeline = None
-if DIARIZATION_AVAILABLE:
-    try:
-        diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization",
-            use_auth_token=os.getenv("HUGGINGFACE_TOKEN", None)
-        )
-        device = torch.device("cuda" if WHISPER_DEVICE == "cuda" else "cpu")
-        diarization_pipeline.to(device)
-        print(f"[LOG] Диаризация инициализирована на {device}")
-    except Exception as e:
-        print(f"[WARN] Диаризация не загружена: {e}")
 
-# ---------- Вспомогательные функции ----------
-def extract_audio_from_video(video_path: str, audio_path: str) -> bool:
-    cmd = ["ffmpeg", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
-           "-ar", "16000", "-ac", "1", "-y", audio_path]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"[FFmpeg Error] {e.stderr}")
-        return False
+# ---------- Меню ----------
+def get_main_menu() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("📁 Мои отчёты", callback_data="menu_reports")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
+        [InlineKeyboardButton("❓ Помощь", callback_data="menu_help")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def get_audio_duration(audio_path: str) -> float:
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-            capture_output=True, text=True, check=True
-        )
-        return float(result.stdout.strip())
-    except Exception:
-        return 0.0
 
-def split_audio(audio_path: str, chunk_seconds: int, out_dir: str) -> list:
-    pattern = os.path.join(out_dir, "chunk_%03d.wav")
-    cmd = ["ffmpeg", "-i", audio_path, "-f", "segment",
-           "-segment_time", str(chunk_seconds), "-c", "copy", "-y", pattern]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
-    chunks = sorted(Path(out_dir).glob("chunk_*.wav"))
-    return [str(c) for c in chunks]
+async def _auto_stop_watcher(context: ContextTypes.DEFAULT_TYPE):
+    for chat_id in list(active_sessions.keys()):
+        try:
+            stopped = await check_auto_stop(chat_id)
+            if stopped:
+                print(f"[AutoStop] Сессия {chat_id} остановлена")
+        except Exception as e:
+            print(f"[AutoStop] Ошибка: {e}")
 
-def perform_diarization(audio_path: str):
-    if diarization_pipeline is None:
-        return None
-    try:
-        diarization = diarization_pipeline(audio_path)
-        return [(t.start, t.end, spk) for t, _, spk in diarization.itertracks(yield_label=True)]
-    except Exception as e:
-        print(f"[Diarization Error] {e}")
-        return None
-
-def call_deepseek(text: str, model_name: str = "deepseek-reasoner") -> str:
-    prompt = (
-        "Ты — профессиональный корректор транскрипций с диаризацией. "
-        "Исправь все ошибки распознавания речи, расставь знаки препинания, заглавные буквы. "
-        "Сохрани метки говорящих (SPEAKER_01, SPEAKER_02 и т.д.) и оформи их единообразно. "
-        "Разбей текст на абзацы по смене говорящего. "
-        "НЕ добавляй информацию, которой нет. Если слово неразборчиво — оставь [неразборчиво]. "
-        "НЕ меняй смысл реплик.\n\n"
-        f"Транскрипция:\n{text}"
-    )
-    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": "Ты — эксперт по коррекции транскрипций. Отвечай только исправленным текстом."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.0,
-        "max_tokens": 8000
-    }
-    response = requests.post(DEEPSEEK_URL, headers=headers, json=payload, timeout=300)
-    response.raise_for_status()
-    data = response.json()
-    msg = data["choices"][0]["message"]
-    content = (msg.get("content") or "").strip()
-    if not content:
-        content = (msg.get("reasoning_content") or "").strip()
-    return content
-
-def improve_text(text: str) -> str:
-    if not text or len(text.strip()) < 5:
-        return text
-
-    try:
-        result = call_deepseek(text, "deepseek-reasoner")
-        if result:
-            return result
-        print("[DeepSeek] Reasoner вернул пусто, пробую chat")
-    except requests.exceptions.Timeout:
-        print("[DeepSeek] Reasoner timeout, пробую chat")
-    except Exception as e:
-        print(f"[DeepSeek] Reasoner error: {e}, пробую chat")
-
-    try:
-        result = call_deepseek(text, "deepseek-chat")
-        if result:
-            return result
-    except Exception as e:
-        print(f"[DeepSeek] Chat error: {e}")
-
-    return text
-
-def merge_transcription_with_diarization(transcription_segments, diarization_segments):
-    if not diarization_segments:
-        return " ".join(seg.text for seg in transcription_segments)
-    intervals = list(diarization_segments)
-    result_parts = []
-    for seg in transcription_segments:
-        best_speaker, max_overlap = None, 0
-        for s_start, s_end, speaker in intervals:
-            overlap = max(0, min(seg.end, s_end) - max(seg.start, s_start))
-            if overlap > max_overlap:
-                max_overlap, best_speaker = overlap, speaker
-        if best_speaker:
-            result_parts.append(f"[{best_speaker}] {seg.text.strip()}")
-        else:
-            result_parts.append(seg.text.strip())
-    return "\n".join(result_parts)
-
-def transcribe_audio(audio_path: str) -> str:
-    duration = get_audio_duration(audio_path)
-    print(f"[LOG] Длительность аудио: {duration:.1f} сек")
-
-    if duration < CHUNK_MINUTES * 60 * 1.5:
-        segments, _ = model.transcribe(
-            audio_path, beam_size=5, language='ru', temperature=0.0,
-            vad_filter=True, word_timestamps=True, condition_on_previous_text=False
-        )
-        segs = list(segments)
-        diar = perform_diarization(audio_path) if diarization_pipeline else None
-        return merge_transcription_with_diarization(segs, diar) if diar \
-               else " ".join(s.text for s in segs)
-
-    print(f"[LOG] Длинное аудио, чанки по {CHUNK_MINUTES} мин")
-    tmp_dir = tempfile.mkdtemp(prefix="chunks_")
-    try:
-        chunks = split_audio(audio_path, CHUNK_MINUTES * 60, tmp_dir)
-        print(f"[LOG] Чанков: {len(chunks)}")
-        full_text_parts = []
-        for i, chunk in enumerate(chunks, 1):
-            print(f"[LOG] Обработка чанка {i}/{len(chunks)}")
-            segments, _ = model.transcribe(
-                chunk, beam_size=5, language='ru', temperature=0.0,
-                vad_filter=True, word_timestamps=True, condition_on_previous_text=False
-            )
-            segs = list(segments)
-            diar = perform_diarization(chunk) if diarization_pipeline else None
-            if diar:
-                full_text_parts.append(merge_transcription_with_diarization(segs, diar))
-            else:
-                full_text_parts.append(" ".join(s.text for s in segs))
-        return "\n".join(full_text_parts)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-def estimate_time(duration_sec: float) -> str:
-    """Возвращает строку с оценкой времени обработки."""
-    total_sec = duration_sec * WHISPER_SPEED_FACTOR
-    if diarization_pipeline is not None:
-        total_sec += duration_sec * DIARIZATION_FACTOR
-    total_sec += 90  # запас на DeepSeek
-
-    minutes = int(total_sec // 60)
-    if minutes < 1:
-        return "менее 1 минуты"
-    if minutes < 60:
-        return f"около {minutes} мин"
-    hours = minutes // 60
-    remainder = minutes % 60
-    if remainder == 0:
-        return f"около {hours} ч"
-    return f"около {hours} ч {remainder} мин"
 
 async def send_long_message(update: Update, text: str):
-    """Отправляет длинный текст частями (Telegram лимит 4096)."""
     limit = 4000
     if len(text) <= limit:
         await update.message.reply_text(text)
@@ -237,20 +54,51 @@ async def send_long_message(update: Update, text: str):
     for idx, part in enumerate(parts, 1):
         await update.message.reply_text(f"Часть {idx}/{len(parts)}:\n\n{part}")
 
-# ---------- Обработчики ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Транскрибатор аудио и видео с определением говорящих.\n"
-        "Отправьте голосовое сообщение, аудиофайл или видео. "
-        "Бот вернёт готовую расшифровку."
-    )
 
+# ---------- Команды ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🎙️ Транскрибатор аудио, видео и конференций.\n\n"
+        "Что я умею:\n"
+        "• Отправьте голосовое, аудио или видео — пришлю расшифровку с анализом.\n"
+        "• Отправьте ссылку на Яндекс.Телемост — подключусь, запишу и пришлю отчёт.\n\n"
+        "Меню:"
+    )
+    await update.message.reply_text(text, reply_markup=get_main_menu())
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📋 Главное меню:", reply_markup=get_main_menu())
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📖 Справка:\n\n"
+        "🔹 Отправьте аудио / видео / голосовое — получите транскрипцию и отчёт.\n"
+        "🔹 Отправьте ссылку telemost.yandex.ru — бот подключится к конференции.\n"
+        "🔹 /stop — принудительно остановить запись конференции.\n"
+        "🔹 /menu — главное меню.\n\n"
+        "📁 Все отчёты и аудиозаписи сохраняются в личной картотеке."
+    )
+    await update.message.reply_text(text)
+
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in active_sessions:
+        await update.message.reply_text("Нет активной сессии конференции.")
+        return
+    await stop_conference(chat_id, update)
+
+
+# ---------- Обработка медиа ----------
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     attachment = update.message.voice or update.message.audio or update.message.video
     if not attachment:
         await update.message.reply_text("Не удалось найти медиафайл.")
         return
 
+    user_id = update.effective_user.id
     file = await attachment.get_file()
     file_ext = file.file_path.split('.')[-1] if '.' in file.file_path else 'bin'
 
@@ -261,37 +109,111 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await file.download_to_drive(raw_path)
 
-        # Извлекаем аудио
         if update.message.video or file_ext.lower() not in ("wav",):
             if not extract_audio_from_video(raw_path, audio_path):
                 audio_path = raw_path
         else:
             audio_path = raw_path
 
-        # Оценка времени
         duration = get_audio_duration(audio_path)
         if duration > 0:
-            est = estimate_time(duration)
+            est = estimate_time(duration, diarization_pipeline is not None)
             await update.message.reply_text(
                 f"Файл получен. Длительность: {int(duration // 60)} мин {int(duration % 60)} сек.\n"
-                f"Обработка займёт {est}. Дождитесь ответа — я пришлю готовый текст."
-            )
-        else:
-            await update.message.reply_text(
-                "Файл получен. Обработка займёт некоторое время. Дождитесь ответа."
+                f"Обработка займёт {est}."
             )
 
-        # Транскрипция
-        raw_text = transcribe_audio(audio_path)
-        if not raw_text.strip():
+        await update.message.reply_text("Распознаю речь...")
+        segments = transcribe_audio(audio_path)
+        if not segments:
             await update.message.reply_text("Речь не обнаружена.")
             return
 
-        # Улучшение
-        improved = improve_text(raw_text)
+        transcript_text = segments_to_text(segments)
+        improved = improve_text(transcript_text)
 
-        # Отправляем финальный результат
+        speakers_info = {}
+        try:
+            speakers_info = extract_speakers_and_roles(transcript_text)
+        except Exception as e:
+            print(f"[Speakers] Ошибка: {e}")
+
+        # Fallback
+        real = {s.get('speaker') for s in segments if s.get('speaker')}
+        ds = [k for k in speakers_info.keys() if k not in ("candidate_speaker", "interviewer_speaker")]
+        if len(real) <= 1 and len(ds) >= 2:
+            try:
+                from deepseek_client import resplit_by_speakers
+                from transcription import text_to_segments
+                resplit_text = resplit_by_speakers(transcript_text, speakers_info)
+                new_segments = text_to_segments(resplit_text)
+                if new_segments and any(s.get('speaker') for s in new_segments):
+                    segments = new_segments
+            except Exception as e:
+                print(f"[Fallback] {e}")
+
+        effective_candidate = "Аудио"
+        effective_position = ""
+        if speakers_info:
+            cand = speakers_info.get("candidate_speaker")
+            if cand and cand in speakers_info:
+                info = speakers_info[cand]
+                if isinstance(info, dict):
+                    if info.get("name"):
+                        effective_candidate = info["name"]
+                    if info.get("position"):
+                        effective_position = info["position"]
+
+        # Анализ (если длинное)
+        analysis = ""
+        if duration >= 120:
+            await update.message.reply_text("Формирую аналитический отчёт...")
+            analysis = analyze_interview(improved, speakers_info=speakers_info)
+
+        # DOCX
+        docx_path = os.path.join(tmp_dir, "report.docx")
+        create_docx(
+            segments=segments,
+            output_path=docx_path,
+            meeting_url="",
+            analysis_text=analysis,
+            candidate_name=effective_candidate,
+            position=effective_position,
+            speakers_info=speakers_info
+        )
+
+        # Сохраняем в картотеку
+        save_entry(
+            user_id=user_id,
+            source_audio=audio_path,
+            report_path=docx_path,
+            candidate_name=effective_candidate,
+            position=effective_position or "Медиа",
+            duration=duration,
+            num_speakers=len({s.get('speaker') for s in segments if s.get('speaker')}),
+            kind="media"
+        )
+
+        # Красивое имя
+        safe_cand = _safe_filename(effective_candidate or "Аудио")
+        safe_pos = _safe_filename(effective_position) if effective_position else "Медиа"
+        date_part = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        base_name = f"{safe_cand}_{safe_pos}_{date_part}"
+
+        # Отправка DOCX
+        with open(docx_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"{base_name}.docx",
+                caption="Отчёт: транскрипция + анализ"
+            )
+
+        # Отправка текста для быстрого просмотра
         await send_long_message(update, improved)
+
+        await update.message.reply_text(
+            "✅ Сохранено в картотеке. Откройте /menu → Мои отчёты."
+        )
 
     except Exception as e:
         print(f"[Error] {e}")
@@ -299,10 +221,182 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    chat_id = update.effective_chat.id
+
+    if "telemost.yandex.ru" not in url:
+        await update.message.reply_text("Это не ссылка на Яндекс.Телемост.")
+        return
+
+    if chat_id in active_sessions:
+        await update.message.reply_text("Уже есть активная сессия. Отправьте /stop.")
+        return
+
+    await update.message.reply_text("Подключаюсь к конференции...")
+    await join_conference(chat_id, url, update)
+
+
+# ---------- Callback-кнопки ----------
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if data == "menu_reports":
+        await show_reports(query, user_id)
+
+    elif data == "menu_stats":
+        stats = get_stats(user_id)
+        mins = stats["total_duration_sec"] // 60
+        secs = stats["total_duration_sec"] % 60
+        text = (
+            f"📊 Статистика:\n\n"
+            f"• Всего записей: {stats['total']}\n"
+            f"• Общая длительность: {mins} мин {secs} сек"
+        )
+        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data == "menu_help":
+        text = (
+            "📖 Справка:\n\n"
+            "🔹 Отправьте аудио/видео/голосовое — получите отчёт.\n"
+            "🔹 Отправьте ссылку telemost.yandex.ru — бот запишет конференцию.\n"
+            "🔹 /stop — остановить запись.\n\n"
+            "Все отчёты сохраняются в картотеке."
+        )
+        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data == "menu_back":
+        await query.message.edit_text("📋 Главное меню:", reply_markup=get_main_menu())
+
+    elif data.startswith("rep_"):
+        entry_id = data[4:]
+        await show_entry_detail(query, user_id, entry_id)
+
+    elif data.startswith("dl_docx_"):
+        entry_id = data[8:]
+        await send_file(query, user_id, entry_id, kind="report")
+
+    elif data.startswith("dl_audio_"):
+        entry_id = data[9:]
+        await send_file(query, user_id, entry_id, kind="audio")
+
+    elif data.startswith("del_"):
+        entry_id = data[4:]
+        if delete_entry(user_id, entry_id):
+            await query.answer("Удалено")
+            await show_reports(query, user_id)
+        else:
+            await query.answer("Не найдено")
+
+
+async def show_reports(query, user_id: int):
+    entries = list_entries(user_id)
+    if not entries:
+        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
+        await query.message.edit_text(
+            "📁 Картотека пуста.\nОтправьте аудио или ссылку на Телемост.",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+
+    keyboard = []
+    for e in entries[:10]:
+        label = f"📄 {e['candidate']}"
+        if e.get('position'):
+            label += f" — {e['position']}"
+        label += f" ({e['datetime']})"
+        if len(label) > 64:
+            label = label[:61] + "..."
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"rep_{e['id']}")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_back")])
+
+    await query.message.edit_text(
+        f"📁 Ваши отчёты ({len(entries)}):",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_entry_detail(query, user_id: int, entry_id: str):
+    entry = get_entry(user_id, entry_id)
+    if not entry:
+        await query.answer("Запись не найдена")
+        return
+
+    mins = entry["duration_sec"] // 60
+    secs = entry["duration_sec"] % 60
+
+    text = (
+        f"📋 {entry['candidate']}\n"
+        f"Должность: {entry.get('position') or '—'}\n"
+        f"Дата: {entry['datetime']}\n"
+        f"Длительность: {mins} мин {secs} сек\n"
+        f"Спикеров: {entry.get('num_speakers', 0)}"
+    )
+
+    keyboard = []
+    if entry.get("report_file"):
+        keyboard.append([InlineKeyboardButton("📄 Скачать DOCX", callback_data=f"dl_docx_{entry_id}")])
+    if entry.get("audio_file"):
+        keyboard.append([InlineKeyboardButton("🎧 Скачать аудио", callback_data=f"dl_audio_{entry_id}")])
+    keyboard.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"del_{entry_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 К списку", callback_data="menu_reports")])
+
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def send_file(query, user_id: int, entry_id: str, kind: str):
+    path = get_file_path(user_id, entry_id, kind=kind)
+    if not path:
+        await query.answer("Файл не найден")
+        return
+
+    entry = get_entry(user_id, entry_id)
+    filename = os.path.basename(path)
+    caption = f"{entry.get('candidate', '')} — {entry.get('position', '')}"
+
+    try:
+        if kind == "report":
+            with open(path, "rb") as f:
+                await query.message.reply_document(
+                    document=f, filename=filename, caption=caption
+                )
+        else:
+            with open(path, "rb") as f:
+                await query.message.reply_audio(
+                    audio=f, filename=filename, caption=caption
+                )
+    except Exception as e:
+        await query.message.reply_text(f"Ошибка отправки: {e}")
+
+
+# ---------- Запуск ----------
 if __name__ == "__main__":
-    print(f"[LOG] Запуск (Whisper {WHISPER_MODEL}/{WHISPER_DEVICE}, reasoner+chat)...")
+    from config import WHISPER_MODEL, WHISPER_DEVICE, ANALYSIS_ENABLED, STORAGE_DIR
+    print(f"[LOG] Запуск (Whisper {WHISPER_MODEL}/{WHISPER_DEVICE}, "
+          f"анализ={'вкл' if ANALYSIS_ENABLED else 'выкл'}, storage={STORAGE_DIR})...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO, handle_media))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.Regex(r"telemost\.yandex\.ru"),
+        handle_link
+    ))
+
+    if app.job_queue:
+        app.job_queue.run_repeating(_auto_stop_watcher, interval=3, first=5)
+    else:
+        print("[WARN] JobQueue недоступен. Установите: pip install 'python-telegram-bot[job-queue]'")
+
     print("[LOG] Бот запущен.")
     app.run_polling()

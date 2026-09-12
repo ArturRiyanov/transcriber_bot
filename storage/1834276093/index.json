@@ -1,0 +1,26 @@
+[
+  {
+    "id": "20260913_013036",
+    "datetime": "13.09.2026 01:30",
+    "candidate": "Аудио",
+    "position": "Медиа",
+    "duration_sec": 28,
+    "num_speakers": 0,
+    "meeting_url": "",
+    "kind": "media",
+    "audio_file": "Аудио_Медиа_2026-09-13_01-30.wav",
+    "report_file": "Аудио_Медиа_2026-09-13_01-30.docx"
+  },
+  {
+    "id": "20260913_012404",
+    "datetime": "13.09.2026 01:24",
+    "candidate": "Иван",
+    "position": "Python-разработчик",
+    "duration_sec": 222,
+    "num_speakers": 2,
+    "meeting_url": "https://telemost.yandex.ru/j/56289057466043",
+    "kind": "interview",
+    "audio_file": "Иван_Python-разработчик_2026-09-13_01-24.wav",
+    "report_file": "Иван_Python-разработчик_2026-09-13_01-24.docx"
+  }
+]
