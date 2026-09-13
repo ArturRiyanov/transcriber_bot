@@ -151,23 +151,27 @@ def improve_text(text: str) -> str:
 
 
 def extract_speakers_and_roles(transcript_text: str) -> dict:
-    """Извлекает имена, роли и должности спикеров из текста интервью."""
+    """
+    Извлекает имена, роли и должности говорящих из транскрипции.
+    Работает и для интервью, и для монологов, и для встреч.
+    """
     if not transcript_text or len(transcript_text.strip()) < 50:
         return {}
 
-    prompt = f"""Проанализируй транскрипцию интервью и извлеки информацию о каждом говорящем.
+    prompt = f"""Проанализируй транскрипцию и извлеки информацию о каждом говорящем.
 
 ТРАНСКРИПЦИЯ:
 {transcript_text}
 
 ЗАДАЧА:
-1. Найди все упоминания участников диалога.
-2. Для каждого участника определи:
+1. Найди всех участников записи.
+2. Для каждого определи:
    - Имя — если он или она представился (Меня зовут..., Я — ..., обращение по имени).
    - Должность или профессию — если упоминается.
-   - Роль в интервью: "Кандидат" или "Интервьюер".
+   - Роль — общее описание: "Кандидат", "Интервьюер", "Ведущий", "Гость", "Докладчик", "Участник" или подобное.
 3. Присвой каждому участнику метку SPEAKER_00, SPEAKER_01, ...
-4. Если имя не названо — оставь пустую строку.
+4. Если запись — монолог (один человек), всё равно укажи его как SPEAKER_00.
+5. Если имя не названо — оставь пустую строку.
 
 ВАЖНО: отвечай ТОЛЬКО валидным JSON без пояснений и markdown-обёрток.
 
@@ -181,20 +185,22 @@ def extract_speakers_and_roles(transcript_text: str) -> dict:
 """
 
     messages = [
-        {"role": "system", "content": "Ты — аналитик интервью. Отвечай строго валидным JSON."},
+        {"role": "system", "content": "Ты — аналитик транскрипций. Отвечай строго валидным JSON."},
         {"role": "user", "content": prompt}
     ]
 
     raw = ""
     try:
-        print("[DeepSeek] Извлекаю имена и роли спикеров...")
-        raw = _call_deepseek(messages, "deepseek-reasoner", max_tokens=2000, timeout=300)
+        print("[DeepSeek] Извлекаю имена и роли говорящих...")
+        raw = _call_deepseek(messages, "deepseek-reasoner",
+                             max_tokens=2000, timeout=300)
     except Exception as e:
         print(f"[DeepSeek] extract reasoner error: {e}")
 
     if not raw:
         try:
-            raw = _call_deepseek(messages, "deepseek-chat", max_tokens=2000, timeout=300)
+            raw = _call_deepseek(messages, "deepseek-chat",
+                                 max_tokens=2000, timeout=300)
         except Exception as e:
             print(f"[DeepSeek] extract chat error: {e}")
 

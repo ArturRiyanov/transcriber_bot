@@ -1,4 +1,7 @@
 import os
+import time
+import asyncio
+import html as html_lib
 import tempfile
 import shutil
 from datetime import datetime
@@ -11,22 +14,29 @@ from telegram.ext import (
     CallbackQueryHandler, filters, ContextTypes
 )
 
-from config import TELEGRAM_TOKEN, cleanup_temp_files
+from config import (
+    TELEGRAM_TOKEN, cleanup_temp_files,
+    SIMPLE_MAX_DURATION_SEC, SIMPLE_MAX_CHARS, SKIP_CLASSIFY_SEC,
+)
 from audio_utils import extract_audio_from_video, get_audio_duration, estimate_time
-from transcription import transcribe_audio, segments_to_text, text_to_segments, diarization_pipeline
+from transcription import (
+    transcribe_audio, segments_to_text, text_to_segments, diarization_pipeline
+)
 from deepseek_client import (
     improve_text, analyze_interview,
     extract_speakers_and_roles, resplit_by_speakers,
     classify_content
 )
 from conference import join_conference, stop_conference, active_sessions, check_auto_stop
-from docx_builder import create_docx
+from docx_builder import create_docx, _resolve_speaker_label
 from storage import (
     save_entry, list_entries, get_entry,
     get_file_path, delete_entry, get_stats, _safe_filename
 )
 
 cleanup_temp_files()
+
+pending_results: dict = {}
 
 
 TYPE_LABELS = {
@@ -38,6 +48,154 @@ TYPE_LABELS = {
     "other": "Прочее",
     "media": "Медиа",
 }
+
+# Типы, для которых принудительно считаем, что говорит один человек
+SINGLE_SPEAKER_TYPES = {"monologue", "lecture"}
+
+
+# ---------- Анимированный статус ----------
+class AnimatedStatus:
+    def __init__(self, message, initial_text: str = "Обработка"):
+        self.message = message
+        self.base_text = initial_text
+        self._running = False
+        self._task = None
+        self._lock = asyncio.Lock()
+        self._dots = 0
+
+    async def _edit(self):
+        text = self.base_text + "." * self._dots
+        async with self._lock:
+            try:
+                await self.message.edit_text(text)
+            except Exception:
+                pass
+
+    async def _loop(self):
+        self._running = True
+        try:
+            while self._running:
+                self._dots = (self._dots % 3) + 1
+                await self._edit()
+                await asyncio.sleep(1.2)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[AnimatedStatus] Ошибка: {e}")
+
+    def start(self):
+        if self._task is None:
+            self._task = asyncio.create_task(self._loop())
+
+    async def set_base(self, text: str):
+        self.base_text = text
+        self._dots = 1
+        await self._edit()
+
+    async def stop(self):
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def delete(self):
+        await self.stop()
+        try:
+            await self.message.delete()
+        except Exception:
+            pass
+
+
+# ---------- Утилиты ----------
+def force_single_speaker(segments):
+    """
+    Объединяет все сегменты в один. Используется для монологов/лекций,
+    где диаризация ошибочно нашла несколько говорящих.
+    """
+    if not segments:
+        return segments
+
+    parts = []
+    start = None
+    end = None
+    for s in segments:
+        text = (s.get('text') or "").strip()
+        if not text:
+            continue
+        parts.append(text)
+        if start is None:
+            start = s.get('start', 0.0)
+        end = s.get('end', 0.0)
+
+    merged = " ".join(parts).strip()
+    if not merged:
+        return segments
+
+    return [{
+        'speaker': None,
+        'text': merged,
+        'start': start if start is not None else 0.0,
+        'end': end if end is not None else 0.0,
+    }]
+
+
+def pick_name_from_speakers(speakers_info: dict):
+    """
+    Возвращает (имя, должность) первого говорящего с заполненным именем.
+    Для интервью приоритет — candidate_speaker.
+    """
+    if not speakers_info:
+        return None, None
+
+    # Приоритет кандидату, если он есть
+    cand = speakers_info.get("candidate_speaker")
+    if cand and cand in speakers_info:
+        info = speakers_info[cand]
+        if isinstance(info, dict) and info.get("name"):
+            return info["name"], info.get("position") or ""
+
+    # Иначе — первый попавшийся с именем
+    for spk, info in speakers_info.items():
+        if spk in ("candidate_speaker", "interviewer_speaker"):
+            continue
+        if isinstance(info, dict) and info.get("name"):
+            return info["name"], info.get("position") or ""
+
+    return None, None
+
+
+def render_for_chat(segments, speakers_info, improved_text: str) -> str:
+    """
+    Текст для чата. Если у говорящих есть имена — использует их.
+    Один говорящий без имён — просто текст.
+    """
+    speakers_info = speakers_info or {}
+    speakers = {s.get('speaker') for s in segments if s.get('speaker')}
+
+    if len(speakers) <= 1 and not speakers_info:
+        joined = " ".join((s.get('text') or "").strip()
+                          for s in segments).strip()
+        return joined or improved_text
+
+    if len(speakers) <= 1:
+        # Один говорящий, возможно с именем — без меток
+        joined = " ".join((s.get('text') or "").strip()
+                          for s in segments).strip()
+        return joined or improved_text
+
+    parts = []
+    for seg in segments:
+        text = (seg.get('text') or "").strip()
+        if not text:
+            continue
+        label = _resolve_speaker_label(seg.get('speaker'), speakers_info)
+        parts.append(f"{label}: {text}")
+
+    return "\n\n".join(parts) if parts else improved_text
 
 
 # ---------- Меню ----------
@@ -70,6 +228,38 @@ async def send_long_message(update: Update, text: str):
         await update.message.reply_text(f"Часть {idx}/{len(parts)}:\n\n{part}")
 
 
+async def send_copyable_text(update: Update, text: str):
+    limit = 3500
+    escaped = html_lib.escape(text)
+    if len(escaped) <= limit:
+        await update.message.reply_text(
+            f"<code>{escaped}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    chunks = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = remaining.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip()
+
+    for chunk in chunks:
+        escaped = html_lib.escape(chunk)
+        await update.message.reply_text(
+            f"<code>{escaped}</code>",
+            parse_mode="HTML"
+        )
+
+
 # ---------- Команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -100,14 +290,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "речь, определит тип контента и сформирует отчёт в формате DOCX. "
         "Для интервью и собеседований дополнительно выполняется "
         "аналитическая оценка кандидата.\n\n"
+        "Если говорящие представились, в выводе используются их имена "
+        "вместо меток SPEAKER_XX.\n\n"
+        "Короткие записи (до 30 сек или до 150 символов) выводятся "
+        "в чат без создания файлов. Кнопка «Сохранить в картотеку» "
+        "позволяет сохранить такую запись при необходимости.\n\n"
         "2. Конференция.\n"
         "Отправьте ссылку telemost.yandex.ru. Бот подключится к встрече, "
-        "запишет её и по завершении пришлёт расшифровку и отчёт. "
-        "Камера и микрофон у бота отключены — он не мешает участникам.\n\n"
+        "запишет её и по завершении пришлёт расшифровку и отчёт.\n\n"
         "3. Картотека.\n"
         "Все расшифровки, отчёты и аудиозаписи сохраняются в личной "
-        "картотеке пользователя. Откройте раздел «Мои отчёты», чтобы "
-        "скачать или удалить запись.\n\n"
+        "картотеке пользователя.\n\n"
         "Команды:\n"
         "/start — главное меню\n"
         "/menu — главное меню\n"
@@ -140,93 +333,163 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_path = os.path.join(tmp_dir, f"media.{file_ext}")
     audio_path = os.path.join(tmp_dir, "audio.wav")
 
+    status_msg = await update.message.reply_text("Обработка.")
+    status = AnimatedStatus(status_msg, "Обработка")
+    status.start()
+
     try:
         await file.download_to_drive(raw_path)
 
         if update.message.video or file_ext.lower() not in ("wav",):
-            if not extract_audio_from_video(raw_path, audio_path):
+            ok = await asyncio.to_thread(
+                extract_audio_from_video, raw_path, audio_path
+            )
+            if not ok:
                 audio_path = raw_path
         else:
             audio_path = raw_path
 
-        duration = get_audio_duration(audio_path)
-        if duration > 0:
-            est = estimate_time(duration, diarization_pipeline is not None)
-            await update.message.reply_text(
-                f"Файл получен. Длительность: "
-                f"{int(duration // 60)} мин {int(duration % 60)} сек.\n"
-                f"Обработка займёт {est}."
-            )
+        duration = await asyncio.to_thread(get_audio_duration, audio_path)
 
-        await update.message.reply_text("Распознаю речь...")
-        segments = transcribe_audio(audio_path)
+        await status.set_base("Распознаю речь")
+        segments = await asyncio.to_thread(transcribe_audio, audio_path)
         if not segments:
-            await update.message.reply_text("Речь не обнаружена.")
+            await status.set_base("Речь не обнаружена")
+            await status.stop()
             return
 
         transcript_text = segments_to_text(segments)
-        improved = improve_text(transcript_text)
+        improved = await asyncio.to_thread(improve_text, transcript_text)
 
-        # ---------- Классификация типа контента ----------
-        classification = {"type": "other", "confidence": 0.0, "reason": ""}
-        try:
-            classification = classify_content(transcript_text)
-        except Exception as e:
-            print(f"[Classify] Ошибка: {e}")
-
-        content_type = classification.get("type", "other")
-        is_interview = (content_type == "interview")
-
-        print(f"[LOG] Тип контента: {content_type} "
-              f"(confidence={classification.get('confidence')}, "
-              f"reason={classification.get('reason')})")
-
-        # ---------- Интервью-специфичная логика ----------
-        speakers_info = {}
-        if is_interview:
+        # ---------- Классификация ----------
+        if duration <= SKIP_CLASSIFY_SEC:
+            classification = {"type": "other", "confidence": 1.0,
+                              "reason": "Короткая запись"}
+            content_type = "other"
+            is_interview = False
+            print(f"[LOG] Классификация пропущена "
+                  f"(длительность {duration:.1f} ≤ {SKIP_CLASSIFY_SEC})")
+        else:
+            await status.set_base("Определяю тип записи")
+            classification = {"type": "other", "confidence": 0.0, "reason": ""}
             try:
-                speakers_info = extract_speakers_and_roles(transcript_text)
+                classification = await asyncio.to_thread(
+                    classify_content, transcript_text
+                )
+            except Exception as e:
+                print(f"[Classify] Ошибка: {e}")
+
+            content_type = classification.get("type", "other")
+            is_interview = (content_type == "interview")
+
+            print(f"[LOG] Тип контента: {content_type} "
+                  f"(confidence={classification.get('confidence')}, "
+                  f"reason={classification.get('reason')})")
+
+        # ---------- Принудительное объединение для монологов/лекций ----------
+        if content_type in SINGLE_SPEAKER_TYPES:
+            before = len(segments)
+            segments = force_single_speaker(segments)
+            print(f"[LOG] Тип {content_type}: объединено "
+                  f"{before} сегментов в один говорящий")
+
+        # ---------- Извлечение имён (для любой записи) ----------
+        speakers_info = {}
+        if duration > SKIP_CLASSIFY_SEC and len(transcript_text.strip()) >= 50:
+            await status.set_base("Определяю говорящих")
+            try:
+                speakers_info = await asyncio.to_thread(
+                    extract_speakers_and_roles, transcript_text
+                )
             except Exception as e:
                 print(f"[Speakers] Ошибка: {e}")
 
-            # Fallback: диаризация нашла 1, DeepSeek — 2+
+        # ---------- Интервью-специфичная логика ----------
+        if is_interview:
             real = {s.get('speaker') for s in segments if s.get('speaker')}
             ds = [k for k in speakers_info.keys()
                   if k not in ("candidate_speaker", "interviewer_speaker")]
             if len(real) <= 1 and len(ds) >= 2:
-                print(f"[Fallback] real={len(real)}, ds={len(ds)}")
                 try:
-                    resplit_text = resplit_by_speakers(transcript_text, speakers_info)
+                    resplit_text = await asyncio.to_thread(
+                        resplit_by_speakers, transcript_text, speakers_info
+                    )
                     new_segments = text_to_segments(resplit_text)
                     if new_segments and any(s.get('speaker') for s in new_segments):
                         segments = new_segments
                 except Exception as e:
                     print(f"[Fallback] Ошибка: {e}")
 
-        # Кандидат и должность — только для интервью
+        # ---------- Имя и должность для названия записи ----------
         effective_candidate = "Медиа"
         effective_position = ""
-        if is_interview and speakers_info:
-            cand = speakers_info.get("candidate_speaker")
-            if cand and cand in speakers_info:
-                info = speakers_info[cand]
-                if isinstance(info, dict):
-                    if info.get("name"):
-                        effective_candidate = info["name"]
-                    if info.get("position"):
-                        effective_position = info["position"]
 
-        # ---------- Аналитический отчёт (только для интервью) ----------
+        picked_name, picked_pos = pick_name_from_speakers(speakers_info)
+        if picked_name:
+            effective_candidate = picked_name
+            if picked_pos:
+                effective_position = picked_pos
+
+        num_speakers = len(
+            {s.get('speaker') for s in segments if s.get('speaker')}
+        )
+
+        chat_text = render_for_chat(segments, speakers_info, improved)
+
+        # ---------- Простой режим ----------
+        is_simple = (
+            not is_interview
+            and (duration <= SIMPLE_MAX_DURATION_SEC
+                 or len(improved) <= SIMPLE_MAX_CHARS)
+        )
+
+        if is_simple:
+            pending_results[user_id] = {
+                "_ts": time.time(),
+                "segments": segments,
+                "transcript_text": transcript_text,
+                "improved_text": improved,
+                "chat_text": chat_text,
+                "speakers_info": speakers_info,
+                "duration": duration,
+                "num_speakers": num_speakers,
+                "content_type": content_type,
+                "classification": classification,
+                "is_interview": False,
+                "audio_path": audio_path,
+                "tmp_dir": tmp_dir,
+                "effective_candidate": effective_candidate,
+                "effective_position": effective_position,
+                "has_analysis": False,
+            }
+
+            await status.delete()
+            await send_copyable_text(update, chat_text)
+
+            await update.message.reply_text(
+                "Нажмите на текст выше, чтобы скопировать его в буфер обмена.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "Сохранить в картотеку",
+                        callback_data="save_simple"
+                    )]
+                ])
+            )
+            return
+
+        # ---------- Обычный режим ----------
         analysis = ""
         if is_interview:
-            await update.message.reply_text(
-                "Формирую аналитический отчёт по кандидату..."
+            await status.set_base("Формирую аналитический отчёт")
+            analysis = await asyncio.to_thread(
+                analyze_interview, improved, speakers_info
             )
-            analysis = analyze_interview(improved, speakers_info=speakers_info)
+        else:
+            await status.set_base("Формирую отчёт")
 
-        # ---------- DOCX ----------
         docx_path = os.path.join(tmp_dir, "report.docx")
-        create_docx(
+        await asyncio.to_thread(
+            create_docx,
             segments=segments,
             output_path=docx_path,
             meeting_url="",
@@ -237,43 +500,67 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             content_type=content_type,
         )
 
-        # ---------- Картотека ----------
-        save_entry(
+        entry = await asyncio.to_thread(
+            save_entry,
             user_id=user_id,
             source_audio=audio_path,
             report_path=docx_path,
             candidate_name=effective_candidate,
             position=effective_position,
             duration=duration,
-            num_speakers=len({s.get('speaker') for s in segments if s.get('speaker')}),
+            num_speakers=num_speakers,
             kind=content_type,
         )
 
-        # ---------- Имя файла ----------
+        pending_results[user_id] = {
+            "_ts": time.time(),
+            "segments": segments,
+            "transcript_text": transcript_text,
+            "improved_text": improved,
+            "chat_text": chat_text,
+            "speakers_info": speakers_info,
+            "duration": duration,
+            "num_speakers": num_speakers,
+            "content_type": content_type,
+            "classification": classification,
+            "is_interview": is_interview,
+            "entry_id": entry["id"],
+            "audio_path": audio_path,
+            "tmp_dir": tmp_dir,
+            "docx_path": docx_path,
+            "effective_candidate": effective_candidate,
+            "effective_position": effective_position,
+            "has_analysis": bool(analysis),
+            "analysis_text": analysis,
+        }
+
         safe_cand = _safe_filename(effective_candidate or "Запись")
         safe_pos = _safe_filename(effective_position) if effective_position else ""
         date_part = datetime.now().strftime("%Y-%m-%d_%H-%M")
         parts = [p for p in (safe_cand, safe_pos, date_part) if p]
         base_name = "_".join(parts)
 
-        # ---------- Отправка ----------
+        await status.delete()
+
         with open(docx_path, "rb") as f:
             await update.message.reply_document(
                 document=f,
                 filename=f"{base_name}.docx",
-                caption=f"Отчёт. Тип записи: {TYPE_LABELS.get(content_type, content_type)}"
+                caption=f"Отчёт. Тип записи: "
+                        f"{TYPE_LABELS.get(content_type, content_type)}"
             )
 
-        await send_long_message(update, improved)
+        await send_copyable_text(update, chat_text)
 
         await update.message.reply_text(
+            "Нажмите на текст выше, чтобы скопировать его.\n\n"
             "Отчёт сохранён в картотеке. Раздел «Мои отчёты» в /menu."
         )
 
     except Exception as e:
         print(f"[Error] {e}")
-        await update.message.reply_text(f"Ошибка обработки: {e}")
-    finally:
+        await status.set_base(f"Ошибка обработки: {e}")
+        await status.stop()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -298,9 +585,83 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Callback-кнопки ----------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
     user_id = query.from_user.id
+
+    if data == "save_simple":
+        pending = pending_results.get(user_id)
+        if not pending:
+            await query.answer("Результат устарел.")
+            return
+
+        await query.answer("Сохраняю...")
+        try:
+            docx_path = os.path.join(pending["tmp_dir"], "report.docx")
+            await asyncio.to_thread(
+                create_docx,
+                segments=pending["segments"],
+                output_path=docx_path,
+                meeting_url="",
+                analysis_text="",
+                candidate_name=pending.get("effective_candidate", "Медиа"),
+                position=pending.get("effective_position", ""),
+                speakers_info=pending.get("speakers_info", {}),
+                content_type=pending.get("content_type", "other"),
+            )
+
+            entry = await asyncio.to_thread(
+                save_entry,
+                user_id=user_id,
+                source_audio=pending["audio_path"],
+                report_path=docx_path,
+                candidate_name=pending.get("effective_candidate", "Медиа"),
+                position=pending.get("effective_position", ""),
+                duration=pending["duration"],
+                num_speakers=pending["num_speakers"],
+                kind=pending.get("content_type", "other"),
+            )
+
+            pending["entry_id"] = entry["id"]
+            pending["docx_path"] = docx_path
+            pending["has_analysis"] = False
+
+            await query.message.edit_text(
+                "Сохранено в картотеке. Раздел «Мои отчёты» в /menu.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "Удалить из картотеки",
+                        callback_data="res_delete_simple"
+                    )]
+                ])
+            )
+        except Exception as e:
+            print(f"[SaveSimple] Ошибка: {e}")
+            await query.message.reply_text(f"Ошибка сохранения: {e}")
+        return
+
+    if data == "res_delete_simple":
+        pending = pending_results.get(user_id)
+        if not pending or not pending.get("entry_id"):
+            await query.answer("Нечего удалять.")
+            return
+        if delete_entry(user_id, pending["entry_id"]):
+            await query.answer("Удалено")
+            await query.message.edit_text(
+                "Удалено из картотеки.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "Сохранить в картотеку",
+                        callback_data="save_simple"
+                    )]
+                ])
+            )
+            pending.pop("entry_id", None)
+            pending.pop("docx_path", None)
+        else:
+            await query.answer("Не найдено")
+        return
+
+    await query.answer()
 
     if data == "menu_reports":
         await show_reports(query, user_id)
@@ -322,10 +683,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Краткая справка.\n\n"
             "Отправьте аудио, видео или голосовое сообщение — получите "
             "расшифровку и отчёт.\n\n"
+            "Если говорящие представились, в выводе используются их имена.\n\n"
+            "Короткие записи выводятся в чат без создания файлов.\n\n"
             "Отправьте ссылку telemost.yandex.ru — бот запишет конференцию "
             "и пришлёт отчёт по завершении.\n\n"
-            "Команда /stop завершает активную запись конференции.\n\n"
-            "Все отчёты сохраняются в картотеке."
+            "Команда /stop завершает активную запись конференции."
         )
         kb = [[InlineKeyboardButton("Назад", callback_data="menu_back")]]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
@@ -366,8 +728,6 @@ async def show_reports(query, user_id: int):
 
     keyboard = []
     for e in entries[:10]:
-        kind = e.get('kind') or 'media'
-        kind_short = TYPE_LABELS.get(kind, kind)
         label = f"{e['candidate']}"
         if e.get('position'):
             label += f" — {e['position']}"

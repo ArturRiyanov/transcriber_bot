@@ -16,70 +16,46 @@ except ImportError:
 # ---------- Telegram ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
-    raise ValueError(
-        "TELEGRAM_TOKEN не задан.\n"
-        "Создайте файл .env рядом с config.py со строкой:\n"
-        "  TELEGRAM_TOKEN=ваш_токен_из_BotFather"
-    )
-
-# ---------- Администраторы ----------
-def _parse_admin_ids():
-    raw = os.getenv("ADMIN_IDS", "")
-    ids = []
-    for part in raw.split(","):
-        part = part.strip()
-        if part.isdigit():
-            ids.append(int(part))
-    return ids
-
-ADMIN_IDS = _parse_admin_ids()
+    raise ValueError("TELEGRAM_TOKEN не задан в .env")
 
 # ---------- DeepSeek ----------
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 if not DEEPSEEK_API_KEY:
-    raise ValueError(
-        "DEEPSEEK_API_KEY не задан. Добавьте в .env:\n"
-        "  DEEPSEEK_API_KEY=ваш_ключ"
-    )
+    raise ValueError("DEEPSEEK_API_KEY not set")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # ---------- Whisper ----------
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
-WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE") or None
-CHUNK_MINUTES = int(os.getenv("CHUNK_MINUTES", "30"))
-CHUNK_OVERLAP_SECONDS = int(os.getenv("CHUNK_OVERLAP_SECONDS", "2"))
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ru")
 
-# float16 — максимальная точность, int8_float16 — компромисс
+# float16 — максимальная точность на GPU
 _default_compute = "float16" if WHISPER_DEVICE == "cuda" else "int8"
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", _default_compute)
 
-# Список терминов/имён, которые часто встречаются в ваших записях.
-# Максимум ~448 токенов. Разделяйте пробелами, как обычный текст.
+# Контекст-подсказка для Whisper (термины, имена). До 448 токенов.
 WHISPER_INITIAL_PROMPT = os.getenv("WHISPER_INITIAL_PROMPT", "").strip()
 
-# ---------- Диаризация (pyannote) ----------
-# Рекомендуется: pyannote/speaker-diarization-community-1 (точнее 3.1)
-# Fallback:      pyannote/speaker-diarization-3.1
-DIARIZATION_MODEL = os.getenv(
-    "DIARIZATION_MODEL",
-    "pyannote/speaker-diarization-community-1"
-)
-# num_speakers=0 означает "определить автоматически".
-# Если точно знаете число спикеров — задайте, качество будет выше.
-DIARIZATION_NUM_SPEAKERS = int(os.getenv("DIARIZATION_NUM_SPEAKERS", "0"))
-DIARIZATION_MIN_SPEAKERS = int(os.getenv("DIARIZATION_MIN_SPEAKERS", "1"))
-DIARIZATION_MAX_SPEAKERS = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "4"))
-# Минимальная длительность реплики, чтобы считать её самостоятельной
-DIARIZATION_MIN_DURATION = float(os.getenv("DIARIZATION_MIN_DURATION", "1.0"))
-# Зазор между репликами одного спикера для склейки
-DIARIZATION_GAP = float(os.getenv("DIARIZATION_GAP", "0.5"))
+# Длинные файлы режем по N минут
+CHUNK_MINUTES = int(os.getenv("CHUNK_MINUTES", "30"))
 
 # ---------- Оценка времени ----------
 WHISPER_SPEED_FACTOR = float(os.getenv("WHISPER_SPEED_FACTOR", "0.15"))
 DIARIZATION_FACTOR = float(os.getenv("DIARIZATION_FACTOR", "0.1"))
-DEEPSEEK_FACTOR = float(os.getenv("DEEPSEEK_FACTOR", "0.05"))
-ANALYSIS_FACTOR = float(os.getenv("ANALYSIS_FACTOR", "0.15"))
+
+# ---------- Диаризация (pyannote) ----------
+DIARIZATION_MODEL = os.getenv(
+    "DIARIZATION_MODEL",
+    "pyannote/speaker-diarization-community-1"
+)
+# 0 = автоопределение. Если знаете точно — поставьте число (2 для интервью 1-на-1)
+DIARIZATION_NUM_SPEAKERS = int(os.getenv("DIARIZATION_NUM_SPEAKERS", "0"))
+DIARIZATION_MIN_SPEAKERS = int(os.getenv("DIARIZATION_MIN_SPEAKERS", "1"))
+DIARIZATION_MAX_SPEAKERS = int(os.getenv("DIARIZATION_MAX_SPEAKERS", "4"))
+# Реплики короче этой длительности присваиваются окружающему спикеру
+DIARIZATION_MIN_DURATION = float(os.getenv("DIARIZATION_MIN_DURATION", "1.0"))
+# Склейка соседних реплик одного спикера при зазоре < GAP
+DIARIZATION_GAP = float(os.getenv("DIARIZATION_GAP", "0.5"))
 
 # ---------- Hugging Face ----------
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
@@ -96,16 +72,25 @@ POSITION_NAME = os.getenv("POSITION_NAME", "")
 SEND_AUDIO = os.getenv("SEND_AUDIO", "true").lower() == "true"
 MAX_AUDIO_SIZE_MB = int(os.getenv("MAX_AUDIO_SIZE_MB", "45"))
 
+# ---------- Простой режим ----------
+# Запись не сохраняется в картотеку и не создаёт DOCX, если:
+# - это не интервью И
+#   (длительность <= SIMPLE_MAX_DURATION_SEC ИЛИ текст <= SIMPLE_MAX_CHARS).
+# Пользователь может сохранить такую запись кнопкой в чате.
+SIMPLE_MAX_DURATION_SEC = int(os.getenv("SIMPLE_MAX_DURATION_SEC", "30"))
+SIMPLE_MAX_CHARS = int(os.getenv("SIMPLE_MAX_CHARS", "150"))
+
+# Аудио короче этого порога не отправляется на классификацию в DeepSeek
+# (экономия времени и денег — короткие «алло, привет» не нуждаются в анализе)
+SKIP_CLASSIFY_SEC = int(os.getenv("SKIP_CLASSIFY_SEC", "10"))
+
 # ---------- Картотека ----------
 STORAGE_DIR = os.getenv(
     "STORAGE_DIR",
     str(Path.home() / "transcriber_bot" / "storage")
 )
 
-# ---------- TTL ----------
-PENDING_TTL_SECONDS = int(os.getenv("PENDING_TTL_SECONDS", "3600"))
-
-
+# ---------- Имена спикеров (fallback) ----------
 def _parse_speaker_names():
     raw = os.getenv("SPEAKER_NAMES", "")
     mapping = {}
@@ -120,21 +105,15 @@ SPEAKER_NAMES = _parse_speaker_names()
 
 
 def cleanup_temp_files():
-    tmp_root = Path(tempfile.gettempdir())
-    prefixes = ("transcriber_", "chunks_", "conference_")
+    patterns = ["temp_*", "chunk_*"]
     count = 0
-    now = time.time()
-    for prefix in prefixes:
-        for d in tmp_root.glob(f"{prefix}*"):
+    for pattern in patterns:
+        for f in Path(".").glob(pattern):
             try:
-                if now - d.stat().st_mtime < 6 * 3600:
-                    continue
-                if d.is_dir():
-                    shutil.rmtree(d, ignore_errors=True)
-                else:
-                    d.unlink()
-                count += 1
+                if f.is_file():
+                    f.unlink()
+                    count += 1
             except Exception:
                 pass
     if count:
-        print(f"[Cleanup] Удалено временных объектов: {count}")
+        print(f"[Cleanup] Удалено временных файлов: {count}")

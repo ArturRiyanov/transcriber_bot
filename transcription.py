@@ -1,13 +1,35 @@
 import re
+import warnings
 import tempfile
 import shutil
+from collections import defaultdict
 from pathlib import Path
+
+# Заглушаем warnings pyannote ДО импорта
+warnings.filterwarnings(
+    "ignore",
+    message=r"TensorFloat-32 \(TF32\) has been disabled.*"
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*degrees of freedom is <= 0.*"
+)
+
 from faster_whisper import WhisperModel
 
-from config import WHISPER_MODEL, WHISPER_DEVICE, CHUNK_MINUTES, HUGGINGFACE_TOKEN
+from config import (
+    WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE,
+    WHISPER_LANGUAGE, WHISPER_INITIAL_PROMPT,
+    CHUNK_MINUTES, HUGGINGFACE_TOKEN,
+    DIARIZATION_MODEL, DIARIZATION_NUM_SPEAKERS,
+    DIARIZATION_MIN_SPEAKERS, DIARIZATION_MAX_SPEAKERS,
+    DIARIZATION_MIN_DURATION, DIARIZATION_GAP,
+)
 from audio_utils import get_audio_duration, split_audio
 
-model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type="int8")
+model = WhisperModel(
+    WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
+)
 
 try:
     from pyannote.audio import Pipeline
@@ -21,36 +43,176 @@ diarization_pipeline = None
 if DIARIZATION_AVAILABLE:
     try:
         diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            token=HUGGINGFACE_TOKEN
+            DIARIZATION_MODEL, token=HUGGINGFACE_TOKEN,
         )
         device = torch.device("cuda" if WHISPER_DEVICE == "cuda" else "cpu")
         diarization_pipeline.to(device)
-        print(f"[LOG] Диаризация инициализирована на {device}")
+        print(f"[LOG] Диаризация: {DIARIZATION_MODEL} на {device}")
     except Exception as e:
-        print(f"[WARN] Диаризация не загружена: {e}")
-        diarization_pipeline = None
+        print(f"[WARN] Не загрузилась {DIARIZATION_MODEL}: {e}")
+        try:
+            diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                token=HUGGINGFACE_TOKEN,
+            )
+            device = torch.device("cuda" if WHISPER_DEVICE == "cuda" else "cpu")
+            diarization_pipeline.to(device)
+            print("[LOG] Фолбэк на speaker-diarization-3.1")
+        except Exception as e2:
+            print(f"[WARN] Диаризация не загружена: {e2}")
+            diarization_pipeline = None
+
+
+# ================= ДИАРИЗАЦИЯ =================
+
+def _extract_annotation(output):
+    """Нормализация возвращаемого значения pyannote 3.x / 4.x."""
+    if hasattr(output, "speaker_diarization"):
+        return output.speaker_diarization
+    if hasattr(output, "itertracks"):
+        return output
+    if hasattr(output, "annotation"):
+        return output.annotation
+    return output
+
+
+def _prune_ghost_speakers(segments, total_duration: float,
+                          min_share: float = 0.10):
+    """Убирает спикеров с суммарной долей меньше min_share."""
+    if not segments or total_duration <= 0:
+        return segments
+
+    durations = defaultdict(float)
+    for s, e, spk in segments:
+        durations[spk] += (e - s)
+
+    threshold = total_duration * min_share
+    main_speakers = {spk for spk, d in durations.items() if d >= threshold}
+    if not main_speakers:
+        main_speakers = {max(durations, key=durations.get)}
+
+    cleaned = []
+    for i, (s, e, spk) in enumerate(segments):
+        if spk in main_speakers:
+            cleaned.append((s, e, spk))
+            continue
+        left = next((segments[j][2] for j in range(i - 1, -1, -1)
+                     if segments[j][2] in main_speakers), None)
+        right = next((segments[j][2] for j in range(i + 1, len(segments))
+                      if segments[j][2] in main_speakers), None)
+        replacement = left or right or next(iter(main_speakers))
+        cleaned.append((s, e, replacement))
+
+    return cleaned
+
+
+def merge_short_speaker_segments(segments, total_duration: float = 0.0,
+                                 min_duration: float = None,
+                                 gap: float = None):
+    """
+    Постобработка диаризации.
+    - Убирает мусор < 0.15 сек.
+    - Склеивает соседей одного спикера при зазоре < gap.
+    - Поглощает короткие вставки, если соседи — один и тот же спикер.
+    - Убирает фантомных спикеров (< 10% общей длительности).
+    """
+    if not segments:
+        return segments
+
+    if min_duration is None:
+        min_duration = DIARIZATION_MIN_DURATION
+    if gap is None:
+        gap = DIARIZATION_GAP
+
+    segments = sorted(segments, key=lambda x: x[0])
+    segments = [s for s in segments if (s[1] - s[0]) >= 0.15]
+    if not segments:
+        return segments
+
+    merged = []
+    for start, end, spk in segments:
+        if merged:
+            p_start, p_end, p_spk = merged[-1]
+            if p_spk == spk and start - p_end < gap:
+                merged[-1] = (p_start, end, p_spk)
+                continue
+        merged.append((start, end, spk))
+
+    if len(merged) >= 3:
+        cleaned = [merged[0]]
+        for i in range(1, len(merged) - 1):
+            start, end, spk = merged[i]
+            duration = end - start
+            left_spk = cleaned[-1][2]
+            right_spk = merged[i + 1][2]
+            if (duration < min_duration
+                    and left_spk == right_spk
+                    and spk != left_spk):
+                p_start, _, _ = cleaned[-1]
+                cleaned[-1] = (p_start, end, left_spk)
+            else:
+                cleaned.append(merged[i])
+        cleaned.append(merged[-1])
+        merged = cleaned
+
+    if total_duration > 0:
+        merged = _prune_ghost_speakers(merged, total_duration, min_share=0.10)
+
+    return merged
 
 
 def perform_diarization(audio_path: str):
     if diarization_pipeline is None:
         return None
     try:
-        diarization = diarization_pipeline(audio_path)
-        return [(t.start, t.end, spk) for t, _, spk in diarization.itertracks(yield_label=True)]
+        kwargs = {}
+        if DIARIZATION_NUM_SPEAKERS > 0:
+            kwargs["num_speakers"] = DIARIZATION_NUM_SPEAKERS
+        else:
+            kwargs["min_speakers"] = DIARIZATION_MIN_SPEAKERS
+            kwargs["max_speakers"] = DIARIZATION_MAX_SPEAKERS
+
+        total_duration = get_audio_duration(audio_path)
+        output = diarization_pipeline(audio_path, **kwargs)
+        annotation = _extract_annotation(output)
+
+        if not hasattr(annotation, "itertracks"):
+            print(f"[Diarization] Не удалось извлечь annotation из "
+                  f"{type(output).__name__}")
+            return None
+
+        raw = [
+            (t.start, t.end, spk)
+            for t, _, spk in annotation.itertracks(yield_label=True)
+        ]
+        print(f"[LOG] Сырых интервалов: {len(raw)}")
+
+        cleaned = merge_short_speaker_segments(
+            raw, total_duration=total_duration
+        )
+        speakers = sorted({s[2] for s in cleaned})
+        print(f"[LOG] После постобработки: {len(cleaned)} интервалов, "
+              f"спикеров: {len(speakers)}")
+        return cleaned
     except Exception as e:
+        import traceback
         print(f"[Diarization Error] {e}")
+        traceback.print_exc()
         return None
 
 
-def merge_transcription_with_diarization(transcription_segments, diarization_segments, time_offset: float = 0.0):
+def merge_transcription_with_diarization(
+    transcription_segments, diarization_segments, time_offset: float = 0.0
+):
     if not diarization_segments:
         text = " ".join(seg.text.strip() for seg in transcription_segments)
         return [{
             'speaker': None,
             'text': text,
-            'start': (transcription_segments[0].start + time_offset) if transcription_segments else 0.0,
-            'end': (transcription_segments[-1].end + time_offset) if transcription_segments else 0.0,
+            'start': (transcription_segments[0].start + time_offset)
+                     if transcription_segments else 0.0,
+            'end': (transcription_segments[-1].end + time_offset)
+                   if transcription_segments else 0.0,
         }]
 
     intervals = list(diarization_segments)
@@ -78,43 +240,90 @@ def merge_transcription_with_diarization(transcription_segments, diarization_seg
     return grouped
 
 
+# ================= ТЕКСТ <-> СЕГМЕНТЫ =================
+
 def segments_to_text(segments: list) -> str:
     if not segments:
         return ""
-    if all(s['speaker'] is None for s in segments):
+    speakers = {s['speaker'] for s in segments if s['speaker']}
+    if len(speakers) <= 1:
         return " ".join(s['text'] for s in segments)
-    return "\n".join(f"[{s['speaker'] or 'SPEAKER_UNKNOWN'}] {s['text']}" for s in segments)
+    return "\n".join(
+        f"[{s['speaker'] or 'SPEAKER_UNKNOWN'}] {s['text']}" for s in segments
+    )
+
+
+_SPEAKER_LINE_RE = re.compile(
+    r'^\s*\[(?P<spk>SPEAKER_\w+)\]\s*(?P<text>.*)$',
+    re.MULTILINE
+)
 
 
 def text_to_segments(text: str) -> list:
-    """Парсит '[SPEAKER_XX] текст' в список сегментов."""
     if not text:
         return []
-
-    pattern = re.compile(r'\[(SPEAKER_\w+)\]\s*(.+?)(?=\n\[SPEAKER_\w+\]|\Z)', re.DOTALL)
-    matches = pattern.findall(text)
-
-    if not matches:
-        return [{'speaker': None, 'text': text.strip(), 'start': 0.0, 'end': 0.0}]
-
+    lines = text.split('\n')
     segments = []
-    for speaker, content in matches:
-        content = content.strip().replace('\n', ' ')
-        if content:
-            segments.append({
-                'speaker': speaker,
-                'text': content,
+    current = None
+    for line in lines:
+        m = _SPEAKER_LINE_RE.match(line)
+        if m:
+            if current:
+                segments.append(current)
+            current = {
+                'speaker': m.group('spk'),
+                'text': m.group('text').strip(),
                 'start': 0.0,
                 'end': 0.0,
-            })
-    return segments
+            }
+        else:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if current is None:
+                current = {
+                    'speaker': None,
+                    'text': stripped,
+                    'start': 0.0,
+                    'end': 0.0,
+                }
+            else:
+                current['text'] = (current['text'] + " " + stripped).strip()
+    if current:
+        segments.append(current)
+    if not segments:
+        return [{'speaker': None, 'text': text.strip(),
+                 'start': 0.0, 'end': 0.0}]
+    return [s for s in segments if s['text']]
 
+
+# ================= ТРАНСКРИБАЦИЯ =================
 
 def _transcribe_single(path: str, time_offset: float = 0.0) -> list:
+    """
+    Пунктуация и точность:
+    - temperature=0.0 — строгий режим, без fallback
+    - condition_on_previous_text=False — модель генерирует каждое окно
+      заново, не «продолжает» предыдущий стиль. Пунктуация сохраняется.
+    - initial_prompt — пример русского текста с пунктуацией, задаёт стиль.
+    - compression_ratio_threshold=3.5 — разрешает повторы и мат.
+    - log_prob_threshold=-1.5 — мягче к «неуверенным» сегментам.
+    - no_speech_threshold=0.6 — не выкидывает тихие фрагменты.
+    """
+    prompt = WHISPER_INITIAL_PROMPT or None
     segments, _ = model.transcribe(
-        path, beam_size=5, language='ru', temperature=0.0,
-        vad_filter=True, word_timestamps=True,
-        condition_on_previous_text=False
+        path,
+        beam_size=5,
+        language=WHISPER_LANGUAGE,
+        temperature=0.0,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        initial_prompt=prompt,
+        compression_ratio_threshold=3.5,
+        log_prob_threshold=-1.5,
+        no_speech_threshold=0.6,
     )
     segs = list(segments)
     diar = perform_diarization(path) if diarization_pipeline else None
