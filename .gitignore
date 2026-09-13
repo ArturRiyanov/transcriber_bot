@@ -1,8 +1,10 @@
-venv/
 __pycache__/
 *.pyc
+.env
+venv/
+storage/
 *.wav
+*.mp3
 *.webm
-*.ogg
-temp_audio.*
-nohup.out
+*.mov
+*.mp4
