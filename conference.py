@@ -417,7 +417,7 @@ async def stop_conference(chat_id: int, update=None):
             kind="interview"
         )
 
-        # ---------- Красивое имя файла для отправки ----------
+        # ---------- Красивое имя файла ----------
         safe_cand = _safe_filename(effective_candidate or "Кандидат")
         safe_pos = _safe_filename(effective_position) if effective_position else "Без_должности"
         date_part = datetime.now().strftime("%Y-%m-%d_%H-%M")

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "20260913_150408",
+    "datetime": "13.09.2026 15:04",
+    "candidate": "Аудио",
+    "position": "Медиа",
+    "duration_sec": 180,
+    "num_speakers": 2,
+    "meeting_url": "",
+    "kind": "media",
+    "audio_file": "Аудио_Медиа_2026-09-13_15-04.wav",
+    "report_file": "Аудио_Медиа_2026-09-13_15-04.docx"
+  },
+  {
+    "id": "20260913_142219",
+    "datetime": "13.09.2026 14:22",
+    "candidate": "Елена",
+    "position": "продавец-консультант",
+    "duration_sec": 199,
+    "num_speakers": 2,
+    "meeting_url": "https://telemost.yandex.ru/j/87759928414283",
+    "kind": "interview",
+    "audio_file": "Елена_продавец-консультант_2026-09-13_14-22.wav",
+    "report_file": "Елена_продавец-консультант_2026-09-13_14-22.docx"
+  }
+]
