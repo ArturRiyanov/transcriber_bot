@@ -26,6 +26,99 @@ def _call_deepseek(messages: list, model_name: str = "deepseek-chat",
     return (msg.get("content") or "").strip()
 
 
+def classify_content(transcript_text: str) -> dict:
+    """
+    Определяет тип контента транскрипта.
+    Возвращает {"type": ..., "confidence": float, "reason": str}.
+    Типы: interview | meeting | lecture | monologue | dialogue | other
+    """
+    if not transcript_text or len(transcript_text.strip()) < 50:
+        return {"type": "other", "confidence": 0.0,
+                "reason": "Слишком короткий текст"}
+
+    prompt = f"""Проанализируй транскрипт и определи его тип. Отвечай ТОЛЬКО валидным JSON.
+
+ДОПУСТИМЫЕ ТИПЫ:
+- "interview" — интервью или собеседование. Один или несколько интервьюеров задают вопросы кандидату или респонденту, оценивают его опыт, навыки, мотивацию.
+- "meeting" — рабочая встреча, планёрка, совещание, обсуждение рабочих вопросов в команде.
+- "lecture" — лекция, доклад, выступление, презентация для аудитории.
+- "monologue" — монолог, начитка, озвучка, один говорящий без диалога.
+- "dialogue" — бытовой или иной диалог, не подходящий под предыдущие категории.
+- "other" — ничего из перечисленного.
+
+ПРИЗНАКИ ИНТЕРВЬЮ:
+- один участник задаёт вопросы о биографии, опыте, навыках другого
+- второй развёрнуто отвечает о себе
+- типичные фразы: "расскажите о себе", "ваш опыт", "почему ушли", "как вы видите", "какие у вас планы"
+
+ВАЖНО:
+- Если запись НЕ похожа на интервью или собеседование — не выбирай "interview" только потому, что говорящих несколько.
+- Обычная рабочая встреча — это "meeting", а не "interview".
+- Одиночная начитка или озвучка — это "monologue".
+
+ФОРМАТ ОТВЕТА:
+{{"type": "interview", "confidence": 0.85, "reason": "краткое обоснование"}}
+
+ТРАНСКРИПТ:
+{transcript_text[:6000]}"""
+
+    messages = [
+        {"role": "system", "content": "Ты — классификатор транскриптов. Отвечай строго валидным JSON."},
+        {"role": "user", "content": prompt}
+    ]
+
+    raw = ""
+    try:
+        raw = _call_deepseek(messages, "deepseek-chat",
+                             max_tokens=500, timeout=120)
+    except Exception as e:
+        print(f"[DeepSeek] classify error: {e}")
+
+    if not raw:
+        return {"type": "other", "confidence": 0.0,
+                "reason": "Ошибка классификации"}
+
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    data = None
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                data = None
+
+    if not isinstance(data, dict):
+        return {"type": "other", "confidence": 0.0,
+                "reason": "Не удалось распарсить ответ"}
+
+    t = (data.get("type") or "other").lower().strip()
+    if t not in ("interview", "meeting", "lecture",
+                 "monologue", "dialogue", "other"):
+        t = "other"
+
+    try:
+        conf = float(data.get("confidence") or 0.0)
+    except Exception:
+        conf = 0.0
+
+    return {
+        "type": t,
+        "confidence": conf,
+        "reason": (data.get("reason") or "").strip()
+    }
+
+
 def improve_text(text: str) -> str:
     if not IMPROVE_TEXT:
         print("[DeepSeek] Улучшение отключено")
@@ -70,8 +163,8 @@ def extract_speakers_and_roles(transcript_text: str) -> dict:
 ЗАДАЧА:
 1. Найди все упоминания участников диалога.
 2. Для каждого участника определи:
-   - Имя — если он/она представился («Меня зовут...», «Я — ...», обращение по имени).
-   - Должность / профессию — если упоминается.
+   - Имя — если он или она представился (Меня зовут..., Я — ..., обращение по имени).
+   - Должность или профессию — если упоминается.
    - Роль в интервью: "Кандидат" или "Интервьюер".
 3. Присвой каждому участнику метку SPEAKER_00, SPEAKER_01, ...
 4. Если имя не названо — оставь пустую строку.
@@ -174,7 +267,7 @@ def resplit_by_speakers(text: str, speakers_info: dict) -> str:
 3. Определяй спикера по СМЫСЛУ:
    - Кто задаёт вопросы — Интервьюер.
    - Кто отвечает, представляется, рассказывает о себе — Кандидат.
-   - Фразы «Меня зовут X», «Я — X» относятся к тому спикеру, чьё имя упомянуто.
+   - Фразы Меня зовут X, Я — X относятся к тому спикеру, чьё имя упомянуто.
 4. НЕ меняй текст реплик. НЕ добавляй и НЕ удаляй слова.
 5. Если один спикер говорит несколько предложений подряд — это одна реплика.
 6. Отвечай ТОЛЬКО размеченным текстом, без пояснений.
@@ -249,7 +342,7 @@ def analyze_interview(transcript_text: str, speakers_info: dict = None) -> str:
 
 КРАТКОЕ РЕЗЮМЕ
 
-ТЕХНИЧЕСКИЕ / ПРОФЕССИОНАЛЬНЫЕ ЗНАНИЯ (оценка 1-10)
+ТЕХНИЧЕСКИЕ И ПРОФЕССИОНАЛЬНЫЕ ЗНАНИЯ (оценка 1-10)
 
 КОММУНИКАТИВНЫЕ НАВЫКИ (оценка 1-10)
 

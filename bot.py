@@ -13,8 +13,12 @@ from telegram.ext import (
 
 from config import TELEGRAM_TOKEN, cleanup_temp_files
 from audio_utils import extract_audio_from_video, get_audio_duration, estimate_time
-from transcription import transcribe_audio, segments_to_text, diarization_pipeline
-from deepseek_client import improve_text, analyze_interview, extract_speakers_and_roles
+from transcription import transcribe_audio, segments_to_text, text_to_segments, diarization_pipeline
+from deepseek_client import (
+    improve_text, analyze_interview,
+    extract_speakers_and_roles, resplit_by_speakers,
+    classify_content
+)
 from conference import join_conference, stop_conference, active_sessions, check_auto_stop
 from docx_builder import create_docx
 from storage import (
@@ -25,12 +29,23 @@ from storage import (
 cleanup_temp_files()
 
 
+TYPE_LABELS = {
+    "interview": "Интервью / собеседование",
+    "meeting": "Рабочая встреча",
+    "lecture": "Лекция / доклад",
+    "monologue": "Монолог",
+    "dialogue": "Диалог",
+    "other": "Прочее",
+    "media": "Медиа",
+}
+
+
 # ---------- Меню ----------
 def get_main_menu() -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("📁 Мои отчёты", callback_data="menu_reports")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="menu_help")],
+        [InlineKeyboardButton("Мои отчёты", callback_data="menu_reports")],
+        [InlineKeyboardButton("Статистика", callback_data="menu_stats")],
+        [InlineKeyboardButton("Как пользоваться", callback_data="menu_help")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -58,27 +73,46 @@ async def send_long_message(update: Update, text: str):
 # ---------- Команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🎙️ Транскрибатор аудио, видео и конференций.\n\n"
-        "Что я умею:\n"
-        "• Отправьте голосовое, аудио или видео — пришлю расшифровку с анализом.\n"
-        "• Отправьте ссылку на Яндекс.Телемост — подключусь, запишу и пришлю отчёт.\n\n"
+        "Транскрибатор аудио, видео и конференций.\n\n"
+        "Возможности:\n"
+        "1. Транскрибация файла. Отправьте голосовое, аудио или видео — "
+        "пришлю расшифровку. Бот определяет тип записи: интервью, "
+        "рабочая встреча, лекция, монолог или диалог. Для интервью и "
+        "собеседований дополнительно формируется аналитический отчёт "
+        "по кандидату.\n\n"
+        "2. Конференция. Отправьте ссылку telemost.yandex.ru. Бот "
+        "подключится, запишет встречу с отключёнными камерой и микрофоном "
+        "и пришлёт отчёт по завершении.\n\n"
         "Меню:"
     )
     await update.message.reply_text(text, reply_markup=get_main_menu())
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📋 Главное меню:", reply_markup=get_main_menu())
+    await update.message.reply_text("Главное меню:", reply_markup=get_main_menu())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📖 Справка:\n\n"
-        "🔹 Отправьте аудио / видео / голосовое — получите транскрипцию и отчёт.\n"
-        "🔹 Отправьте ссылку telemost.yandex.ru — бот подключится к конференции.\n"
-        "🔹 /stop — принудительно остановить запись конференции.\n"
-        "🔹 /menu — главное меню.\n\n"
-        "📁 Все отчёты и аудиозаписи сохраняются в личной картотеке."
+        "Как пользоваться.\n\n"
+        "1. Транскрибация файла.\n"
+        "Отправьте аудио, видео или голосовое сообщение. Бот распознает "
+        "речь, определит тип контента и сформирует отчёт в формате DOCX. "
+        "Для интервью и собеседований дополнительно выполняется "
+        "аналитическая оценка кандидата.\n\n"
+        "2. Конференция.\n"
+        "Отправьте ссылку telemost.yandex.ru. Бот подключится к встрече, "
+        "запишет её и по завершении пришлёт расшифровку и отчёт. "
+        "Камера и микрофон у бота отключены — он не мешает участникам.\n\n"
+        "3. Картотека.\n"
+        "Все расшифровки, отчёты и аудиозаписи сохраняются в личной "
+        "картотеке пользователя. Откройте раздел «Мои отчёты», чтобы "
+        "скачать или удалить запись.\n\n"
+        "Команды:\n"
+        "/start — главное меню\n"
+        "/menu — главное меню\n"
+        "/stop — остановить запись конференции\n"
+        "/help — эта справка"
     )
     await update.message.reply_text(text)
 
@@ -119,7 +153,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if duration > 0:
             est = estimate_time(duration, diarization_pipeline is not None)
             await update.message.reply_text(
-                f"Файл получен. Длительность: {int(duration // 60)} мин {int(duration % 60)} сек.\n"
+                f"Файл получен. Длительность: "
+                f"{int(duration // 60)} мин {int(duration % 60)} сек.\n"
                 f"Обработка займёт {est}."
             )
 
@@ -132,29 +167,46 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         transcript_text = segments_to_text(segments)
         improved = improve_text(transcript_text)
 
-        speakers_info = {}
+        # ---------- Классификация типа контента ----------
+        classification = {"type": "other", "confidence": 0.0, "reason": ""}
         try:
-            speakers_info = extract_speakers_and_roles(transcript_text)
+            classification = classify_content(transcript_text)
         except Exception as e:
-            print(f"[Speakers] Ошибка: {e}")
+            print(f"[Classify] Ошибка: {e}")
 
-        # Fallback
-        real = {s.get('speaker') for s in segments if s.get('speaker')}
-        ds = [k for k in speakers_info.keys() if k not in ("candidate_speaker", "interviewer_speaker")]
-        if len(real) <= 1 and len(ds) >= 2:
+        content_type = classification.get("type", "other")
+        is_interview = (content_type == "interview")
+
+        print(f"[LOG] Тип контента: {content_type} "
+              f"(confidence={classification.get('confidence')}, "
+              f"reason={classification.get('reason')})")
+
+        # ---------- Интервью-специфичная логика ----------
+        speakers_info = {}
+        if is_interview:
             try:
-                from deepseek_client import resplit_by_speakers
-                from transcription import text_to_segments
-                resplit_text = resplit_by_speakers(transcript_text, speakers_info)
-                new_segments = text_to_segments(resplit_text)
-                if new_segments and any(s.get('speaker') for s in new_segments):
-                    segments = new_segments
+                speakers_info = extract_speakers_and_roles(transcript_text)
             except Exception as e:
-                print(f"[Fallback] {e}")
+                print(f"[Speakers] Ошибка: {e}")
 
-        effective_candidate = "Аудио"
+            # Fallback: диаризация нашла 1, DeepSeek — 2+
+            real = {s.get('speaker') for s in segments if s.get('speaker')}
+            ds = [k for k in speakers_info.keys()
+                  if k not in ("candidate_speaker", "interviewer_speaker")]
+            if len(real) <= 1 and len(ds) >= 2:
+                print(f"[Fallback] real={len(real)}, ds={len(ds)}")
+                try:
+                    resplit_text = resplit_by_speakers(transcript_text, speakers_info)
+                    new_segments = text_to_segments(resplit_text)
+                    if new_segments and any(s.get('speaker') for s in new_segments):
+                        segments = new_segments
+                except Exception as e:
+                    print(f"[Fallback] Ошибка: {e}")
+
+        # Кандидат и должность — только для интервью
+        effective_candidate = "Медиа"
         effective_position = ""
-        if speakers_info:
+        if is_interview and speakers_info:
             cand = speakers_info.get("candidate_speaker")
             if cand and cand in speakers_info:
                 info = speakers_info[cand]
@@ -164,13 +216,15 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if info.get("position"):
                         effective_position = info["position"]
 
-        # Анализ (если длинное)
+        # ---------- Аналитический отчёт (только для интервью) ----------
         analysis = ""
-        if duration >= 120:
-            await update.message.reply_text("Формирую аналитический отчёт...")
+        if is_interview:
+            await update.message.reply_text(
+                "Формирую аналитический отчёт по кандидату..."
+            )
             analysis = analyze_interview(improved, speakers_info=speakers_info)
 
-        # DOCX
+        # ---------- DOCX ----------
         docx_path = os.path.join(tmp_dir, "report.docx")
         create_docx(
             segments=segments,
@@ -179,40 +233,41 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             analysis_text=analysis,
             candidate_name=effective_candidate,
             position=effective_position,
-            speakers_info=speakers_info
+            speakers_info=speakers_info,
+            content_type=content_type,
         )
 
-        # Сохраняем в картотеку
+        # ---------- Картотека ----------
         save_entry(
             user_id=user_id,
             source_audio=audio_path,
             report_path=docx_path,
             candidate_name=effective_candidate,
-            position=effective_position or "Медиа",
+            position=effective_position,
             duration=duration,
             num_speakers=len({s.get('speaker') for s in segments if s.get('speaker')}),
-            kind="media"
+            kind=content_type,
         )
 
-        # Красивое имя
-        safe_cand = _safe_filename(effective_candidate or "Аудио")
-        safe_pos = _safe_filename(effective_position) if effective_position else "Медиа"
+        # ---------- Имя файла ----------
+        safe_cand = _safe_filename(effective_candidate or "Запись")
+        safe_pos = _safe_filename(effective_position) if effective_position else ""
         date_part = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        base_name = f"{safe_cand}_{safe_pos}_{date_part}"
+        parts = [p for p in (safe_cand, safe_pos, date_part) if p]
+        base_name = "_".join(parts)
 
-        # Отправка DOCX
+        # ---------- Отправка ----------
         with open(docx_path, "rb") as f:
             await update.message.reply_document(
                 document=f,
                 filename=f"{base_name}.docx",
-                caption="Отчёт: транскрипция + анализ"
+                caption=f"Отчёт. Тип записи: {TYPE_LABELS.get(content_type, content_type)}"
             )
 
-        # Отправка текста для быстрого просмотра
         await send_long_message(update, improved)
 
         await update.message.reply_text(
-            "✅ Сохранено в картотеке. Откройте /menu → Мои отчёты."
+            "Отчёт сохранён в картотеке. Раздел «Мои отчёты» в /menu."
         )
 
     except Exception as e:
@@ -231,7 +286,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if chat_id in active_sessions:
-        await update.message.reply_text("Уже есть активная сессия. Отправьте /stop.")
+        await update.message.reply_text(
+            "Уже есть активная сессия. Отправьте /stop для завершения текущей."
+        )
         return
 
     await update.message.reply_text("Подключаюсь к конференции...")
@@ -253,26 +310,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mins = stats["total_duration_sec"] // 60
         secs = stats["total_duration_sec"] % 60
         text = (
-            f"📊 Статистика:\n\n"
-            f"• Всего записей: {stats['total']}\n"
-            f"• Общая длительность: {mins} мин {secs} сек"
+            "Статистика.\n\n"
+            f"Всего записей: {stats['total']}\n"
+            f"Общая длительность: {mins} мин {secs} сек"
         )
-        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
+        kb = [[InlineKeyboardButton("Назад", callback_data="menu_back")]]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == "menu_help":
         text = (
-            "📖 Справка:\n\n"
-            "🔹 Отправьте аудио/видео/голосовое — получите отчёт.\n"
-            "🔹 Отправьте ссылку telemost.yandex.ru — бот запишет конференцию.\n"
-            "🔹 /stop — остановить запись.\n\n"
+            "Краткая справка.\n\n"
+            "Отправьте аудио, видео или голосовое сообщение — получите "
+            "расшифровку и отчёт.\n\n"
+            "Отправьте ссылку telemost.yandex.ru — бот запишет конференцию "
+            "и пришлёт отчёт по завершении.\n\n"
+            "Команда /stop завершает активную запись конференции.\n\n"
             "Все отчёты сохраняются в картотеке."
         )
-        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
+        kb = [[InlineKeyboardButton("Назад", callback_data="menu_back")]]
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == "menu_back":
-        await query.message.edit_text("📋 Главное меню:", reply_markup=get_main_menu())
+        await query.message.edit_text("Главное меню:", reply_markup=get_main_menu())
 
     elif data.startswith("rep_"):
         entry_id = data[4:]
@@ -298,26 +357,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_reports(query, user_id: int):
     entries = list_entries(user_id)
     if not entries:
-        kb = [[InlineKeyboardButton("🔙 Назад", callback_data="menu_back")]]
+        kb = [[InlineKeyboardButton("Назад", callback_data="menu_back")]]
         await query.message.edit_text(
-            "📁 Картотека пуста.\nОтправьте аудио или ссылку на Телемост.",
+            "Картотека пуста. Отправьте аудио, видео или ссылку на Телемост.",
             reply_markup=InlineKeyboardMarkup(kb)
         )
         return
 
     keyboard = []
     for e in entries[:10]:
-        label = f"📄 {e['candidate']}"
+        kind = e.get('kind') or 'media'
+        kind_short = TYPE_LABELS.get(kind, kind)
+        label = f"{e['candidate']}"
         if e.get('position'):
             label += f" — {e['position']}"
         label += f" ({e['datetime']})"
         if len(label) > 64:
             label = label[:61] + "..."
         keyboard.append([InlineKeyboardButton(label, callback_data=f"rep_{e['id']}")])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_back")])
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="menu_back")])
 
     await query.message.edit_text(
-        f"📁 Ваши отчёты ({len(entries)}):",
+        f"Ваши отчёты ({len(entries)}):",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -330,22 +391,26 @@ async def show_entry_detail(query, user_id: int, entry_id: str):
 
     mins = entry["duration_sec"] // 60
     secs = entry["duration_sec"] % 60
+    kind = entry.get('kind') or 'media'
+    kind_label = TYPE_LABELS.get(kind, kind)
 
     text = (
-        f"📋 {entry['candidate']}\n"
+        f"Запись.\n"
+        f"Название: {entry['candidate']}\n"
         f"Должность: {entry.get('position') or '—'}\n"
         f"Дата: {entry['datetime']}\n"
         f"Длительность: {mins} мин {secs} сек\n"
-        f"Спикеров: {entry.get('num_speakers', 0)}"
+        f"Спикеров: {entry.get('num_speakers', 0)}\n"
+        f"Тип: {kind_label}"
     )
 
     keyboard = []
     if entry.get("report_file"):
-        keyboard.append([InlineKeyboardButton("📄 Скачать DOCX", callback_data=f"dl_docx_{entry_id}")])
+        keyboard.append([InlineKeyboardButton("Скачать DOCX", callback_data=f"dl_docx_{entry_id}")])
     if entry.get("audio_file"):
-        keyboard.append([InlineKeyboardButton("🎧 Скачать аудио", callback_data=f"dl_audio_{entry_id}")])
-    keyboard.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"del_{entry_id}")])
-    keyboard.append([InlineKeyboardButton("🔙 К списку", callback_data="menu_reports")])
+        keyboard.append([InlineKeyboardButton("Скачать аудио", callback_data=f"dl_audio_{entry_id}")])
+    keyboard.append([InlineKeyboardButton("Удалить", callback_data=f"del_{entry_id}")])
+    keyboard.append([InlineKeyboardButton("К списку", callback_data="menu_reports")])
 
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -358,7 +423,7 @@ async def send_file(query, user_id: int, entry_id: str, kind: str):
 
     entry = get_entry(user_id, entry_id)
     filename = os.path.basename(path)
-    caption = f"{entry.get('candidate', '')} — {entry.get('position', '')}"
+    caption = f"{entry.get('candidate', '')} — {entry.get('position', '')}".strip(" —")
 
     try:
         if kind == "report":

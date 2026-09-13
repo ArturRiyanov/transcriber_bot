@@ -10,7 +10,8 @@ from audio_utils import extract_audio_from_video, get_audio_duration
 from transcription import transcribe_audio, segments_to_text, text_to_segments
 from deepseek_client import (
     improve_text, analyze_interview,
-    extract_speakers_and_roles, resplit_by_speakers
+    extract_speakers_and_roles, resplit_by_speakers,
+    classify_content
 )
 from docx_builder import create_docx
 from storage import save_entry, _safe_filename
@@ -20,6 +21,16 @@ from config import (
 )
 
 active_sessions = {}
+
+TYPE_LABELS = {
+    "interview": "Интервью / собеседование",
+    "meeting": "Рабочая встреча",
+    "lecture": "Лекция / доклад",
+    "monologue": "Монолог",
+    "dialogue": "Диалог",
+    "other": "Прочее",
+    "media": "Медиа",
+}
 
 # ---------- JavaScript ----------
 JS_START_RECORDING = """
@@ -173,7 +184,7 @@ async def _monitor_conference(chat_id: int, page, update):
                     print(f"[Monitor] Конференция завершена: {result.get('reason')}")
                     try:
                         await update.message.reply_text(
-                            "Конференция завершена. Останавливаю запись и обрабатываю..."
+                            "Конференция завершена. Останавливаю запись и обрабатываю."
                         )
                     except Exception:
                         pass
@@ -247,16 +258,18 @@ async def join_conference(chat_id: int, url: str, update):
 
         result = await page.evaluate(JS_START_RECORDING)
         if not result.get("success"):
-            await update.message.reply_text(f"Не удалось начать запись: {result.get('message')}")
+            await update.message.reply_text(
+                f"Не удалось начать запись: {result.get('message')}"
+            )
             return False
 
         monitor_task = asyncio.create_task(_monitor_conference(chat_id, page, update))
         active_sessions[chat_id]['monitor_task'] = monitor_task
 
         await update.message.reply_text(
-            "Подключился к конференции и начал запись.\n\n"
-            "Камера и микрофон отключены.\n"
-            "Запись остановится автоматически при завершении конференции или по /stop."
+            "Запись начата. Камера и микрофон бота отключены.\n"
+            "Запись остановится автоматически при завершении конференции "
+            "или по команде /stop."
         )
         return True
     except Exception as e:
@@ -305,7 +318,9 @@ async def stop_conference(chat_id: int, update=None):
 
     if not result.get("success"):
         if update:
-            await update.message.reply_text(f"Ошибка остановки записи: {result.get('message')}")
+            await update.message.reply_text(
+                f"Ошибка остановки записи: {result.get('message')}"
+            )
         return
 
     audio_base64 = result.get("data")
@@ -323,7 +338,7 @@ async def stop_conference(chat_id: int, update=None):
             f.write(base64.b64decode(audio_base64))
 
         if update:
-            await update.message.reply_text("Конвертирую аудио...")
+            await update.message.reply_text("Обрабатываю запись...")
 
         if not extract_audio_from_video(webm_path, wav_path):
             if update:
@@ -333,7 +348,7 @@ async def stop_conference(chat_id: int, update=None):
         duration = get_audio_duration(wav_path)
 
         if update:
-            await update.message.reply_text("Распознаю речь и определяю говорящих...")
+            await update.message.reply_text("Распознаю речь...")
 
         segments = transcribe_audio(wav_path)
         if not segments:
@@ -344,39 +359,56 @@ async def stop_conference(chat_id: int, update=None):
         transcript_text = segments_to_text(segments)
         improved_text = improve_text(transcript_text)
 
-        speakers_info = {}
-        if update:
-            await update.message.reply_text("Анализирую участников...")
+        # ---------- Классификация ----------
+        classification = {"type": "other", "confidence": 0.0, "reason": ""}
         try:
-            speakers_info = extract_speakers_and_roles(transcript_text)
+            classification = classify_content(transcript_text)
         except Exception as e:
-            print(f"[Speakers] Ошибка: {e}")
+            print(f"[Classify] Ошибка: {e}")
 
-        real_speakers = {s.get('speaker') for s in segments if s.get('speaker')}
-        num_real = len(real_speakers)
-        deepseek_speakers = [
-            k for k in speakers_info.keys()
-            if k not in ("candidate_speaker", "interviewer_speaker")
-        ]
-        num_deepseek = len(deepseek_speakers)
+        content_type = classification.get("type", "other")
+        is_interview = (content_type == "interview")
 
-        print(f"[LOG] Спикеров: диаризация={num_real}, DeepSeek={num_deepseek}")
+        print(f"[LOG] Тип контента: {content_type} "
+              f"(confidence={classification.get('confidence')}, "
+              f"reason={classification.get('reason')})")
 
-        if num_real <= 1 and num_deepseek >= 2:
-            print("[Fallback] Переразбиваю текст по смысловым репликам...")
+        # ---------- Интервью-специфичная логика ----------
+        speakers_info = {}
+        if is_interview:
             if update:
-                await update.message.reply_text("Разбиваю диалог по репликам...")
+                await update.message.reply_text("Анализирую участников...")
             try:
-                resplit_text = resplit_by_speakers(transcript_text, speakers_info)
-                new_segments = text_to_segments(resplit_text)
-                if new_segments and any(s.get('speaker') for s in new_segments):
-                    segments = new_segments
+                speakers_info = extract_speakers_and_roles(transcript_text)
             except Exception as e:
-                print(f"[Fallback] Ошибка: {e}")
+                print(f"[Speakers] Ошибка: {e}")
 
-        effective_candidate = CANDIDATE_NAME
+            real_speakers = {s.get('speaker') for s in segments if s.get('speaker')}
+            num_real = len(real_speakers)
+            deepseek_speakers = [
+                k for k in speakers_info.keys()
+                if k not in ("candidate_speaker", "interviewer_speaker")
+            ]
+            num_deepseek = len(deepseek_speakers)
+
+            print(f"[LOG] Спикеров: диаризация={num_real}, DeepSeek={num_deepseek}")
+
+            if num_real <= 1 and num_deepseek >= 2:
+                print("[Fallback] Переразбиваю текст по смысловым репликам...")
+                if update:
+                    await update.message.reply_text("Разбиваю диалог по репликам...")
+                try:
+                    resplit_text = resplit_by_speakers(transcript_text, speakers_info)
+                    new_segments = text_to_segments(resplit_text)
+                    if new_segments and any(s.get('speaker') for s in new_segments):
+                        segments = new_segments
+                except Exception as e:
+                    print(f"[Fallback] Ошибка: {e}")
+
+        # Кандидат и должность — только для интервью
+        effective_candidate = CANDIDATE_NAME or "Запись"
         effective_position = POSITION_NAME
-        if speakers_info:
+        if is_interview and speakers_info:
             cand_spk = speakers_info.get("candidate_speaker")
             if cand_spk and cand_spk in speakers_info:
                 info = speakers_info[cand_spk]
@@ -386,13 +418,17 @@ async def stop_conference(chat_id: int, update=None):
                     if info.get("position"):
                         effective_position = info["position"]
 
+        # ---------- Аналитический отчёт ----------
         analysis = ""
-        if ANALYSIS_ENABLED:
+        if ANALYSIS_ENABLED and is_interview:
             if update:
-                await update.message.reply_text("Формирую аналитический отчёт (3-5 минут)...")
+                await update.message.reply_text(
+                    "Формирую аналитический отчёт по кандидату. Это займёт 3-5 минут."
+                )
             analysis = analyze_interview(improved_text, speakers_info=speakers_info)
 
-        docx_path = os.path.join(tmp_dir, "interview_report.docx")
+        # ---------- DOCX ----------
+        docx_path = os.path.join(tmp_dir, "report.docx")
         create_docx(
             segments=segments,
             output_path=docx_path,
@@ -400,12 +436,13 @@ async def stop_conference(chat_id: int, update=None):
             analysis_text=analysis,
             candidate_name=effective_candidate,
             position=effective_position,
-            speakers_info=speakers_info
+            speakers_info=speakers_info,
+            content_type=content_type,
         )
 
-        # ---------- Сохраняем в картотеку ----------
+        # ---------- Картотека ----------
         num_speakers_final = len({s.get('speaker') for s in segments if s.get('speaker')})
-        entry = save_entry(
+        save_entry(
             user_id=chat_id,
             source_audio=wav_path,
             report_path=docx_path,
@@ -414,14 +451,15 @@ async def stop_conference(chat_id: int, update=None):
             duration=duration,
             num_speakers=num_speakers_final,
             meeting_url=url,
-            kind="interview"
+            kind=content_type,
         )
 
-        # ---------- Красивое имя файла ----------
-        safe_cand = _safe_filename(effective_candidate or "Кандидат")
-        safe_pos = _safe_filename(effective_position) if effective_position else "Без_должности"
+        # ---------- Имя файла ----------
+        safe_cand = _safe_filename(effective_candidate or "Запись")
+        safe_pos = _safe_filename(effective_position) if effective_position else ""
         date_part = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        base_name = f"{safe_cand}_{safe_pos}_{date_part}"
+        parts = [p for p in (safe_cand, safe_pos, date_part) if p]
+        base_name = "_".join(parts)
 
         # ---------- Отправка аудио ----------
         if SEND_AUDIO and update:
@@ -432,16 +470,16 @@ async def stop_conference(chat_id: int, update=None):
                         await update.message.reply_audio(
                             audio=f,
                             filename=f"{base_name}.wav",
-                            caption=f"Аудиозапись: {effective_candidate} — {effective_position}",
-                            title="Интервью",
+                            caption=f"Аудиозапись конференции",
+                            title="Запись конференции",
                             performer="Transcriber Bot"
                         )
                 except Exception as e:
                     print(f"[Error] Отправка аудио: {e}")
             else:
                 await update.message.reply_text(
-                    f"Аудио {size_mb:.1f} МБ > {MAX_AUDIO_SIZE_MB} МБ. "
-                    "Скачайте из картотеки через /menu."
+                    f"Аудио {size_mb:.1f} МБ превышает лимит "
+                    f"{MAX_AUDIO_SIZE_MB} МБ. Скачайте из картотеки через /menu."
                 )
 
         # ---------- Отправка DOCX ----------
@@ -450,12 +488,12 @@ async def stop_conference(chat_id: int, update=None):
                 await update.message.reply_document(
                     document=f,
                     filename=f"{base_name}.docx",
-                    caption="Отчёт: транскрипция + анализ кандидата"
+                    caption=f"Отчёт. Тип записи: "
+                            f"{TYPE_LABELS.get(content_type, content_type)}"
                 )
 
             await update.message.reply_text(
-                "✅ Отчёт сохранён в картотеке.\n"
-                "Откройте /menu → Мои отчёты, чтобы скачать позже."
+                "Отчёт сохранён в картотеке. Раздел «Мои отчёты» в /menu."
             )
 
     except Exception as e:

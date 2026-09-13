@@ -7,6 +7,17 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from config import SPEAKER_NAMES
 
 
+TITLE_BY_TYPE = {
+    "interview": "Отчёт по интервью",
+    "meeting": "Протокол встречи",
+    "lecture": "Транскрипция лекции",
+    "monologue": "Транскрипция записи",
+    "dialogue": "Транскрипция диалога",
+    "other": "Транскрипция записи",
+    "media": "Транскрипция записи",
+}
+
+
 def _resolve_speaker_label(speaker_raw: str, speakers_info: dict) -> str:
     if not speaker_raw:
         return "Говорящий"
@@ -93,22 +104,26 @@ def _add_markdown_section(doc, markdown_text: str):
 def create_docx(segments: list, output_path: str,
                 meeting_url: str = "", analysis_text: str = "",
                 candidate_name: str = "", position: str = "",
-                speakers_info: dict = None):
+                speakers_info: dict = None,
+                content_type: str = "interview"):
     speakers_info = speakers_info or {}
+    is_interview = (content_type == "interview")
 
-    if (not candidate_name or candidate_name in ("Кандидат", "")) and speakers_info:
-        cand_spk = speakers_info.get("candidate_speaker")
-        if cand_spk and cand_spk in speakers_info:
-            info = speakers_info[cand_spk]
-            if isinstance(info, dict) and info.get("name"):
-                candidate_name = info["name"]
+    # Интервью-специфичные поля (только для интервью)
+    if is_interview:
+        if (not candidate_name or candidate_name in ("Кандидат", "")) and speakers_info:
+            cand_spk = speakers_info.get("candidate_speaker")
+            if cand_spk and cand_spk in speakers_info:
+                info = speakers_info[cand_spk]
+                if isinstance(info, dict) and info.get("name"):
+                    candidate_name = info["name"]
 
-    if (not position or position in ("", "Не указана")) and speakers_info:
-        cand_spk = speakers_info.get("candidate_speaker")
-        if cand_spk and cand_spk in speakers_info:
-            info = speakers_info[cand_spk]
-            if isinstance(info, dict) and info.get("position"):
-                position = info["position"]
+        if (not position or position in ("", "Не указана")) and speakers_info:
+            cand_spk = speakers_info.get("candidate_speaker")
+            if cand_spk and cand_spk in speakers_info:
+                info = speakers_info[cand_spk]
+                if isinstance(info, dict) and info.get("position"):
+                    position = info["position"]
 
     doc = Document()
     style = doc.styles['Normal']
@@ -116,17 +131,18 @@ def create_docx(segments: list, output_path: str,
     style.font.size = Pt(11)
 
     # ---------- Титул ----------
-    title = doc.add_heading('Отчёт по интервью', 0)
+    title_text = TITLE_BY_TYPE.get(content_type, "Транскрипция записи")
+    title = doc.add_heading(title_text, 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    if candidate_name and candidate_name != "Кандидат":
+    if is_interview and candidate_name and candidate_name != "Кандидат":
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run(f'Кандидат: {candidate_name}')
         run.bold = True
         run.font.size = Pt(14)
 
-    if position:
+    if is_interview and position:
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.add_run(f'Позиция: {position}').font.size = Pt(12)
@@ -140,8 +156,8 @@ def create_docx(segments: list, output_path: str,
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.add_run(f'Дата: {datetime.now().strftime("%d.%m.%Y %H:%M")}').font.size = Pt(10)
 
-    # ---------- Участники ----------
-    if speakers_info:
+    # ---------- Участники (только для интервью) ----------
+    if is_interview and speakers_info:
         participants = []
         for spk, info in speakers_info.items():
             if spk in ("candidate_speaker", "interviewer_speaker"):
@@ -156,7 +172,7 @@ def create_docx(segments: list, output_path: str,
             for label in participants:
                 doc.add_paragraph(label, style='List Bullet')
 
-    # ---------- Аналитический отчёт ----------
+    # ---------- Аналитический отчёт (только для интервью) ----------
     if analysis_text:
         doc.add_page_break()
         doc.add_heading('Аналитический отчёт по кандидату', level=1)
@@ -164,7 +180,8 @@ def create_docx(segments: list, output_path: str,
 
     # ---------- Транскрипция ----------
     doc.add_page_break()
-    doc.add_heading('Транскрипция диалога', level=1)
+    heading_text = 'Транскрипция диалога' if is_interview else 'Транскрипция'
+    doc.add_heading(heading_text, level=1)
 
     prev_speaker = None
     for seg in segments:
