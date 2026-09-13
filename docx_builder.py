@@ -50,7 +50,10 @@ def _resolve_speaker_label(speaker_raw: str, speakers_info: dict) -> str:
     return speaker_raw
 
 
-_NONVERBAL_RE = re.compile(r'(\[[^\]]+\])')
+# Распознаём:
+# 1) [SPEAKER_XX] — невербалка/ремарка в квадратных скобках
+# 2) [[...]] — пометка сомнения из DeepSeek
+_TOKEN_RE = re.compile(r'(\[\[[^\]]+\]\]|\[[^\[\]]+\])')
 
 
 def _add_speaker_replica(doc, speaker_label: str, text: str):
@@ -61,10 +64,18 @@ def _add_speaker_replica(doc, speaker_label: str, text: str):
     run_speaker.font.size = Pt(11)
     run_speaker.font.color.rgb = RGBColor(0x1F, 0x4E, 0x79)
 
-    for part in _NONVERBAL_RE.split(text):
+    for part in _TOKEN_RE.split(text):
         if not part:
             continue
-        if part.startswith('[') and part.endswith(']'):
+        if part.startswith('[[!') and part.endswith(']]'):
+            continue  # на всякий случай, если попадётся что-то вроде [[!x]]
+        if part.startswith('[[') and part.endswith(']]'):
+            # Пометка сомнения — серый курсив
+            inner = part[2:-2]
+            run = p.add_run(inner)
+            run.italic = True
+            run.font.color.rgb = RGBColor(0x9C, 0x27, 0xB0)
+        elif part.startswith('[') and part.endswith(']'):
             run = p.add_run(part)
             run.italic = True
             run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
@@ -109,7 +120,6 @@ def create_docx(segments: list, output_path: str,
     speakers_info = speakers_info or {}
     is_interview = (content_type == "interview")
 
-    # Интервью-специфичные поля (только для интервью)
     if is_interview:
         if (not candidate_name or candidate_name in ("Кандидат", "")) and speakers_info:
             cand_spk = speakers_info.get("candidate_speaker")
@@ -130,7 +140,6 @@ def create_docx(segments: list, output_path: str,
     style.font.name = 'Calibri'
     style.font.size = Pt(11)
 
-    # ---------- Титул ----------
     title_text = TITLE_BY_TYPE.get(content_type, "Транскрипция записи")
     title = doc.add_heading(title_text, 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -156,7 +165,6 @@ def create_docx(segments: list, output_path: str,
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.add_run(f'Дата: {datetime.now().strftime("%d.%m.%Y %H:%M")}').font.size = Pt(10)
 
-    # ---------- Участники (только для интервью) ----------
     if is_interview and speakers_info:
         participants = []
         for spk, info in speakers_info.items():
@@ -172,16 +180,24 @@ def create_docx(segments: list, output_path: str,
             for label in participants:
                 doc.add_paragraph(label, style='List Bullet')
 
-    # ---------- Аналитический отчёт (только для интервью) ----------
     if analysis_text:
         doc.add_page_break()
         doc.add_heading('Аналитический отчёт по кандидату', level=1)
         _add_markdown_section(doc, analysis_text)
 
-    # ---------- Транскрипция ----------
     doc.add_page_break()
     heading_text = 'Транскрипция диалога' if is_interview else 'Транскрипция'
     doc.add_heading(heading_text, level=1)
+
+    # Пояснение про пометки
+    p = doc.add_paragraph()
+    run = p.add_run(
+        "Пометки: серым курсивом выделены места, где возможна ошибка "
+        "распознавания или оговорка."
+    )
+    run.italic = True
+    run.font.size = Pt(9)
+    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
 
     prev_speaker = None
     for seg in segments:

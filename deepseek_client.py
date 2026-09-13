@@ -26,12 +26,78 @@ def _call_deepseek(messages: list, model_name: str = "deepseek-chat",
     return (msg.get("content") or "").strip()
 
 
+def polish_text(text: str, uncertain_words: list = None) -> str:
+    """
+    Исправляет морфологию (падежи, склонения, окончания, согласование),
+    сохраняя смысл. Сомнительные/неразборчивые слова оборачивает в [[...]].
+    Метки [SPEAKER_XX] сохраняются без изменений.
+    """
+    if not text or len(text.strip()) < 5:
+        return text
+
+    uncertain_words = uncertain_words or []
+    uncertain_note = ""
+    if uncertain_words:
+        sample = ", ".join(uncertain_words[:25])
+        uncertain_note = (
+            f"\n\nСПИСОК СЛОВ, ГДЕ ВОЗМОЖНА ОШИБКА РАСПОЗНАВАНИЯ "
+            f"(низкая уверенность):\n{sample}\n"
+            "Эти слова, если они есть в тексте и звучат странно, оберни "
+            "в двойные квадратные скобки [[слово]], чтобы читающий видел: "
+            "возможно, тут оговорка или ошибка распознавания. "
+            "Если по смыслу там очевидно другое слово — оставь как есть "
+            "и всё равно пометь [[...]]."
+        )
+
+    prompt = f"""Ты — редактор русских транскрипций. Работаешь с текстом, полученным из системы распознавания речи.
+
+ЗАДАЧИ:
+1. Исправь падежи, склонения, окончания и согласования слов. Например: «я хотел поужинать» вместо «я хотела поужинать» — если по контексту понятно, что говорит мужчина. «в компанию» вместо «в компания» — если падеж явно неправильный.
+2. Исправь очевидные ошибки распознавания, если по контексту ясно, что за слово имелось в виду. НЕ ДОДУМЫВАЙ, НЕ ПЕРЕФРАЗИРУЙ, НЕ ДОБАВЛЯЙ информацию, которой не было.
+3. Сомнительные/неразборчивые/странные места оберни в двойные квадратные скобки [[...]] — так читающий поймёт, что здесь возможна ошибка.
+4. Метки [SPEAKER_XX] сохрани без изменений.
+5. Пунктуация и заглавные буквы — на твоё усмотрение, по правилам русского языка.
+6. НЕ добавляй пояснений, комментариев, вступлений. Отвечай ТОЛЬКО переработанным текстом.
+
+ПРИМЕРЫ:
+- «он сказал что она пошла домой» → «Он сказал, что она пошла домой.»
+- «я хотел сказать тебе спасибо» → «Я хотел сказать тебе спасибо.»
+- «мы видели как они пришли в офис» → «Мы видели, как они пришли в офис.»
+- странное «Биплан Лайв» → «[[BiPlan Live]]»
+
+{uncertain_note}
+
+ТЕКСТ:
+{text}
+"""
+
+    messages = [
+        {"role": "system", "content": "Ты — редактор русских транскрипций. Отвечай только текстом."},
+        {"role": "user", "content": prompt}
+    ]
+
+    # Сначала reasoner — лучше с русской морфологией
+    try:
+        print("[DeepSeek] Полирую текст (морфология + пометки)...")
+        r = _call_deepseek(messages, "deepseek-reasoner",
+                           max_tokens=8000, timeout=300)
+        if r:
+            return r
+    except Exception as e:
+        print(f"[DeepSeek] polish reasoner error: {e}")
+
+    try:
+        r = _call_deepseek(messages, "deepseek-chat",
+                           max_tokens=8000, timeout=300)
+        if r:
+            return r
+    except Exception as e:
+        print(f"[DeepSeek] polish chat error: {e}")
+
+    return text
+
+
 def classify_content(transcript_text: str) -> dict:
-    """
-    Определяет тип контента транскрипта.
-    Возвращает {"type": ..., "confidence": float, "reason": str}.
-    Типы: interview | meeting | lecture | monologue | dialogue | other
-    """
     if not transcript_text or len(transcript_text.strip()) < 50:
         return {"type": "other", "confidence": 0.0,
                 "reason": "Слишком короткий текст"}
@@ -151,10 +217,6 @@ def improve_text(text: str) -> str:
 
 
 def extract_speakers_and_roles(transcript_text: str) -> dict:
-    """
-    Извлекает имена, роли и должности говорящих из транскрипции.
-    Работает и для интервью, и для монологов, и для встреч.
-    """
     if not transcript_text or len(transcript_text.strip()) < 50:
         return {}
 
@@ -232,10 +294,6 @@ def extract_speakers_and_roles(transcript_text: str) -> dict:
 
 
 def resplit_by_speakers(text: str, speakers_info: dict) -> str:
-    """
-    Разбивает монолитный текст на реплики с метками [SPEAKER_XX] по СМЫСЛУ.
-    Применяется, когда диаризация нашла 1 голос, но в тексте диалог за двоих.
-    """
     if not text or not speakers_info:
         return text
 

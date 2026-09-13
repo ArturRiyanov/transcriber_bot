@@ -5,7 +5,6 @@ import shutil
 from collections import defaultdict
 from pathlib import Path
 
-# Заглушаем warnings pyannote ДО импорта
 warnings.filterwarnings(
     "ignore",
     message=r"TensorFloat-32 \(TF32\) has been disabled.*"
@@ -26,6 +25,11 @@ from config import (
     DIARIZATION_MIN_DURATION, DIARIZATION_GAP,
 )
 from audio_utils import get_audio_duration, split_audio
+
+# Порог вероятности, ниже которого слово считаем «неразборчивым»
+UNCERTAIN_WORD_PROB = 0.45
+# Не больше этого числа сомнительных слов отдаём в пометки
+MAX_UNCERTAIN_WORDS = 25
 
 model = WhisperModel(
     WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE
@@ -66,7 +70,6 @@ if DIARIZATION_AVAILABLE:
 # ================= ДИАРИЗАЦИЯ =================
 
 def _extract_annotation(output):
-    """Нормализация возвращаемого значения pyannote 3.x / 4.x."""
     if hasattr(output, "speaker_diarization"):
         return output.speaker_diarization
     if hasattr(output, "itertracks"):
@@ -78,7 +81,6 @@ def _extract_annotation(output):
 
 def _prune_ghost_speakers(segments, total_duration: float,
                           min_share: float = 0.10):
-    """Убирает спикеров с суммарной долей меньше min_share."""
     if not segments or total_duration <= 0:
         return segments
 
@@ -109,13 +111,6 @@ def _prune_ghost_speakers(segments, total_duration: float,
 def merge_short_speaker_segments(segments, total_duration: float = 0.0,
                                  min_duration: float = None,
                                  gap: float = None):
-    """
-    Постобработка диаризации.
-    - Убирает мусор < 0.15 сек.
-    - Склеивает соседей одного спикера при зазоре < gap.
-    - Поглощает короткие вставки, если соседи — один и тот же спикер.
-    - Убирает фантомных спикеров (< 10% общей длительности).
-    """
     if not segments:
         return segments
 
@@ -204,8 +199,20 @@ def perform_diarization(audio_path: str):
 def merge_transcription_with_diarization(
     transcription_segments, diarization_segments, time_offset: float = 0.0
 ):
+    """
+    Возвращает сегменты вида:
+    {'speaker':..., 'text':..., 'start':..., 'end':..., 'uncertain': [слово, ...]}
+    """
     if not diarization_segments:
-        text = " ".join(seg.text.strip() for seg in transcription_segments)
+        parts = []
+        uncertain_all = []
+        for seg in transcription_segments:
+            text = seg.text.strip()
+            if text:
+                parts.append(text)
+            uncertain_all.extend(_collect_uncertain_words(seg))
+
+        text = " ".join(parts)
         return [{
             'speaker': None,
             'text': text,
@@ -213,6 +220,7 @@ def merge_transcription_with_diarization(
                      if transcription_segments else 0.0,
             'end': (transcription_segments[-1].end + time_offset)
                    if transcription_segments else 0.0,
+            'uncertain': uncertain_all[:MAX_UNCERTAIN_WORDS],
         }]
 
     intervals = list(diarization_segments)
@@ -228,6 +236,7 @@ def merge_transcription_with_diarization(
             'text': seg.text.strip(),
             'start': seg.start + time_offset,
             'end': seg.end + time_offset,
+            'uncertain': _collect_uncertain_words(seg),
         })
 
     grouped = []
@@ -235,9 +244,32 @@ def merge_transcription_with_diarization(
         if grouped and grouped[-1]['speaker'] == item['speaker']:
             grouped[-1]['text'] += " " + item['text']
             grouped[-1]['end'] = item['end']
+            grouped[-1]['uncertain'].extend(item.get('uncertain', []))
         else:
             grouped.append(dict(item))
+
+    for g in grouped:
+        g['uncertain'] = g.get('uncertain', [])[:MAX_UNCERTAIN_WORDS]
+
     return grouped
+
+
+def _collect_uncertain_words(seg):
+    """Возвращает список слов сегмента с низкой probability."""
+    words = getattr(seg, "words", None) or []
+    out = []
+    for w in words:
+        try:
+            prob = getattr(w, "probability", None)
+            if prob is None:
+                continue
+            if prob < UNCERTAIN_WORD_PROB:
+                word = (getattr(w, "word", "") or "").strip()
+                if word:
+                    out.append(word)
+        except Exception:
+            continue
+    return out
 
 
 # ================= ТЕКСТ <-> СЕГМЕНТЫ =================
@@ -251,6 +283,16 @@ def segments_to_text(segments: list) -> str:
     return "\n".join(
         f"[{s['speaker'] or 'SPEAKER_UNKNOWN'}] {s['text']}" for s in segments
     )
+
+
+def get_all_uncertain_words(segments: list) -> list:
+    """Объединяет списки сомнительных слов со всех сегментов."""
+    seen = []
+    for s in segments:
+        for w in (s.get('uncertain') or []):
+            if w not in seen:
+                seen.append(w)
+    return seen[:MAX_UNCERTAIN_WORDS]
 
 
 _SPEAKER_LINE_RE = re.compile(
@@ -275,6 +317,7 @@ def text_to_segments(text: str) -> list:
                 'text': m.group('text').strip(),
                 'start': 0.0,
                 'end': 0.0,
+                'uncertain': [],
             }
         else:
             stripped = line.strip()
@@ -286,6 +329,7 @@ def text_to_segments(text: str) -> list:
                     'text': stripped,
                     'start': 0.0,
                     'end': 0.0,
+                    'uncertain': [],
                 }
             else:
                 current['text'] = (current['text'] + " " + stripped).strip()
@@ -293,23 +337,13 @@ def text_to_segments(text: str) -> list:
         segments.append(current)
     if not segments:
         return [{'speaker': None, 'text': text.strip(),
-                 'start': 0.0, 'end': 0.0}]
+                 'start': 0.0, 'end': 0.0, 'uncertain': []}]
     return [s for s in segments if s['text']]
 
 
 # ================= ТРАНСКРИБАЦИЯ =================
 
 def _transcribe_single(path: str, time_offset: float = 0.0) -> list:
-    """
-    Пунктуация и точность:
-    - temperature=0.0 — строгий режим, без fallback
-    - condition_on_previous_text=False — модель генерирует каждое окно
-      заново, не «продолжает» предыдущий стиль. Пунктуация сохраняется.
-    - initial_prompt — пример русского текста с пунктуацией, задаёт стиль.
-    - compression_ratio_threshold=3.5 — разрешает повторы и мат.
-    - log_prob_threshold=-1.5 — мягче к «неуверенным» сегментам.
-    - no_speech_threshold=0.6 — не выкидывает тихие фрагменты.
-    """
     prompt = WHISPER_INITIAL_PROMPT or None
     segments, _ = model.transcribe(
         path,

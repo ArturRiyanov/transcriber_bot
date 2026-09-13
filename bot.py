@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import html as html_lib
+import re as re_lib
 import tempfile
 import shutil
 from datetime import datetime
@@ -20,12 +21,13 @@ from config import (
 )
 from audio_utils import extract_audio_from_video, get_audio_duration, estimate_time
 from transcription import (
-    transcribe_audio, segments_to_text, text_to_segments, diarization_pipeline
+    transcribe_audio, segments_to_text, text_to_segments,
+    diarization_pipeline, get_all_uncertain_words,
 )
 from deepseek_client import (
-    improve_text, analyze_interview,
+    polish_text, analyze_interview,
     extract_speakers_and_roles, resplit_by_speakers,
-    classify_content
+    classify_content,
 )
 from conference import join_conference, stop_conference, active_sessions, check_auto_stop
 from docx_builder import create_docx, _resolve_speaker_label
@@ -49,7 +51,6 @@ TYPE_LABELS = {
     "media": "Медиа",
 }
 
-# Типы, для которых принудительно считаем, что говорит один человек
 SINGLE_SPEAKER_TYPES = {"monologue", "lecture"}
 
 
@@ -112,10 +113,6 @@ class AnimatedStatus:
 
 # ---------- Утилиты ----------
 def force_single_speaker(segments):
-    """
-    Объединяет все сегменты в один. Используется для монологов/лекций,
-    где диаризация ошибочно нашла несколько говорящих.
-    """
     if not segments:
         return segments
 
@@ -140,25 +137,20 @@ def force_single_speaker(segments):
         'text': merged,
         'start': start if start is not None else 0.0,
         'end': end if end is not None else 0.0,
+        'uncertain': [],
     }]
 
 
 def pick_name_from_speakers(speakers_info: dict):
-    """
-    Возвращает (имя, должность) первого говорящего с заполненным именем.
-    Для интервью приоритет — candidate_speaker.
-    """
     if not speakers_info:
         return None, None
 
-    # Приоритет кандидату, если он есть
     cand = speakers_info.get("candidate_speaker")
     if cand and cand in speakers_info:
         info = speakers_info[cand]
         if isinstance(info, dict) and info.get("name"):
             return info["name"], info.get("position") or ""
 
-    # Иначе — первый попавшийся с именем
     for spk, info in speakers_info.items():
         if spk in ("candidate_speaker", "interviewer_speaker"):
             continue
@@ -168,24 +160,22 @@ def pick_name_from_speakers(speakers_info: dict):
     return None, None
 
 
+_UNWRAP_RE = re_lib.compile(r'\[\[(.*?)\]\]')
+
+
+def unwrap_uncertain(text: str) -> str:
+    """Убирает пометки [[...]] для чистого текста в чате."""
+    return _UNWRAP_RE.sub(r'\1', text)
+
+
 def render_for_chat(segments, speakers_info, improved_text: str) -> str:
-    """
-    Текст для чата. Если у говорящих есть имена — использует их.
-    Один говорящий без имён — просто текст.
-    """
     speakers_info = speakers_info or {}
     speakers = {s.get('speaker') for s in segments if s.get('speaker')}
 
-    if len(speakers) <= 1 and not speakers_info:
-        joined = " ".join((s.get('text') or "").strip()
-                          for s in segments).strip()
-        return joined or improved_text
-
     if len(speakers) <= 1:
-        # Один говорящий, возможно с именем — без меток
         joined = " ".join((s.get('text') or "").strip()
                           for s in segments).strip()
-        return joined or improved_text
+        return unwrap_uncertain(joined or improved_text)
 
     parts = []
     for seg in segments:
@@ -193,9 +183,9 @@ def render_for_chat(segments, speakers_info, improved_text: str) -> str:
         if not text:
             continue
         label = _resolve_speaker_label(seg.get('speaker'), speakers_info)
-        parts.append(f"{label}: {text}")
+        parts.append(f"{label}: {unwrap_uncertain(text)}")
 
-    return "\n\n".join(parts) if parts else improved_text
+    return "\n\n".join(parts) if parts else unwrap_uncertain(improved_text)
 
 
 # ---------- Меню ----------
@@ -290,11 +280,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "речь, определит тип контента и сформирует отчёт в формате DOCX. "
         "Для интервью и собеседований дополнительно выполняется "
         "аналитическая оценка кандидата.\n\n"
-        "Если говорящие представились, в выводе используются их имена "
-        "вместо меток SPEAKER_XX.\n\n"
-        "Короткие записи (до 30 сек или до 150 символов) выводятся "
-        "в чат без создания файлов. Кнопка «Сохранить в картотеку» "
-        "позволяет сохранить такую запись при необходимости.\n\n"
+        "Исправляются окончания, склонения, согласования. Места, где "
+        "распознавание было неуверенным, помечаются — в DOCX они "
+        "выделены серым курсивом.\n\n"
+        "Если говорящие представились, в выводе используются их имена.\n\n"
+        "Короткие записи выводятся в чат без создания файлов.\n\n"
         "2. Конференция.\n"
         "Отправьте ссылку telemost.yandex.ru. Бот подключится к встрече, "
         "запишет её и по завершении пришлёт расшифровку и отчёт.\n\n"
@@ -359,7 +349,18 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         transcript_text = segments_to_text(segments)
-        improved = await asyncio.to_thread(improve_text, transcript_text)
+
+        # Собираем сомнительные слова из Whisper
+        uncertain_words = get_all_uncertain_words(segments)
+        if uncertain_words:
+            print(f"[LOG] Неуверенных слов: {len(uncertain_words)} "
+                  f"({uncertain_words[:10]})")
+
+        # Полируем текст: морфология + пометки
+        await status.set_base("Правлю текст")
+        improved = await asyncio.to_thread(
+            polish_text, transcript_text, uncertain_words
+        )
 
         # ---------- Классификация ----------
         if duration <= SKIP_CLASSIFY_SEC:
@@ -367,8 +368,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               "reason": "Короткая запись"}
             content_type = "other"
             is_interview = False
-            print(f"[LOG] Классификация пропущена "
-                  f"(длительность {duration:.1f} ≤ {SKIP_CLASSIFY_SEC})")
         else:
             await status.set_base("Определяю тип записи")
             classification = {"type": "other", "confidence": 0.0, "reason": ""}
@@ -386,14 +385,14 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   f"(confidence={classification.get('confidence')}, "
                   f"reason={classification.get('reason')})")
 
-        # ---------- Принудительное объединение для монологов/лекций ----------
+        # Принудительное объединение для монологов/лекций
         if content_type in SINGLE_SPEAKER_TYPES:
             before = len(segments)
             segments = force_single_speaker(segments)
             print(f"[LOG] Тип {content_type}: объединено "
                   f"{before} сегментов в один говорящий")
 
-        # ---------- Извлечение имён (для любой записи) ----------
+        # Имена говорящих
         speakers_info = {}
         if duration > SKIP_CLASSIFY_SEC and len(transcript_text.strip()) >= 50:
             await status.set_base("Определяю говорящих")
@@ -404,7 +403,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 print(f"[Speakers] Ошибка: {e}")
 
-        # ---------- Интервью-специфичная логика ----------
+        # Fallback для интервью: диаризация 1, DeepSeek 2+
         if is_interview:
             real = {s.get('speaker') for s in segments if s.get('speaker')}
             ds = [k for k in speakers_info.keys()
@@ -420,7 +419,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     print(f"[Fallback] Ошибка: {e}")
 
-        # ---------- Имя и должность для названия записи ----------
+        # Имя/должность для файла
         effective_candidate = "Медиа"
         effective_position = ""
 
@@ -683,6 +682,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Краткая справка.\n\n"
             "Отправьте аудио, видео или голосовое сообщение — получите "
             "расшифровку и отчёт.\n\n"
+            "Бот исправляет окончания и склонения. Неуверенные места "
+            "помечаются — в DOCX они выделены серым курсивом.\n\n"
             "Если говорящие представились, в выводе используются их имена.\n\n"
             "Короткие записи выводятся в чат без создания файлов.\n\n"
             "Отправьте ссылку telemost.yandex.ru — бот запишет конференцию "
